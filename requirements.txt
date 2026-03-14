@@ -1,0 +1,46 @@
+# tiqu-jp 日本語字幕提取 — Python 依赖
+# ═══════════════════════════════════════════════════════════════
+#
+# ★ 安装顺序很重要：先装 PyTorch（带 CUDA），再装其他依赖
+#
+# === NVIDIA GPU (CUDA) 用户（推荐） ===
+# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+# pip install -r requirements.txt
+#
+# === macOS Apple Silicon 用户 ===
+# pip install torch torchaudio
+# pip install -r requirements.txt
+#
+# === CPU-only 用户 ===
+# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+# pip install -r requirements.txt
+#
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 转录引擎 ────────────────────────────────────────────────
+
+# stable-ts: Whisper 精确时间戳封装（同时支持 faster-whisper 后端）
+stable-ts>=2.16.0
+
+# faster-whisper: CTranslate2 加速后端（速度 2~4×，显存减半）
+faster-whisper>=1.0.0
+
+# OpenAI Whisper (stable-ts 依赖; 使用 faster-whisper 后端时仅用于分词器)
+openai-whisper>=20231117
+
+# ─── 人声分离 ────────────────────────────────────────────────
+
+demucs>=4.0.1
+
+# ─── PyTorch (如果上面已按说明安装，这里会跳过) ──────────────
+
+torch>=2.1.0
+torchaudio>=2.1.0
+
+# ─── 工具 ────────────────────────────────────────────────────
+
+# 进度条（批量处理 + 二次转录）
+tqdm>=4.60.0
+
+# YAML 配置文件支持
+pyyaml>=6.0
