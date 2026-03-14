@@ -1117,6 +1117,17 @@ def postprocess(segments: list[Segment], config: Config) -> list[Segment]:
     for seg in result:
         seg.text = normalize_japanese_punctuation(seg.text)
 
+    # 5.5 回声去重 — 多人同时说话被合并（如「こんにちは。こんにちは」→「こんにちは」）
+    echo_dedup_count = 0
+    for seg in result:
+        cleaned = deduplicate_echo(seg.text)
+        if cleaned != seg.text:
+            logger.info(f"   🔁 回声去重: 「{seg.text}」→「{cleaned}」")
+            seg.text = cleaned
+            echo_dedup_count += 1
+    if echo_dedup_count:
+        logger.info(f"   🔁 回声去重: {echo_dedup_count} 段")
+
     # 6. 去除段首段尾语气词（えっと、あのー 等）
     if config.strip_fillers:
         filler_stripped = 0
@@ -1221,6 +1232,47 @@ def split_long_segment(seg: Segment, config: Config) -> list[Segment]:
         current_time += part_duration
 
     return sub_segments
+
+
+def deduplicate_echo(text: str) -> str:
+    """去重多人同时说话导致的回声合并
+
+    典型场景：节目开场多人互相打招呼，ASR 把两个人的声音合到一条字幕
+    例:
+      「こんにちは。こんにちは」→「こんにちは」
+      「どうも。どうも」→「どうも」
+      「はい。はい。はい」→「はい」
+      「お疲れ様です。お疲れ様です」→「お疲れ様です」
+      「よろしくお願いします。よろしくお願いします」→「よろしくお願いします」
+    但不去重有意义的重复：
+      「はい、分かりました。はい」→ 保持不变（前后文不完全相同）
+    """
+    if not text:
+        return text
+
+    # 按日文句号/感叹号/问号分割
+    parts = re.split(r'[。！？!?]+', text)
+    # 去除空白部分
+    parts = [p.strip('、 　') for p in parts if p.strip('、 　')]
+
+    if len(parts) < 2:
+        return text
+
+    # 检查是否所有部分都相同（允许轻微差异如长音符）
+    first = parts[0]
+    all_same = True
+    for p in parts[1:]:
+        # 标准化比较：去除长音符差异
+        norm_first = first.replace('ー', '').replace('～', '')
+        norm_p = p.replace('ー', '').replace('～', '')
+        if norm_first != norm_p:
+            all_same = False
+            break
+
+    if all_same and len(first) <= 30:  # 只对短句去重（长句重复可能是有意义的）
+        return first
+
+    return text
 
 
 def normalize_japanese_punctuation(text: str) -> str:
