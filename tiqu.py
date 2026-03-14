@@ -836,25 +836,29 @@ class Segment:
 
 # 语气词单元正则（长模式在前防止短模式贪婪匹配）
 _JP_FILLER = (
-    r'えーっと'                # えーっと
+    # ★ 注意：以下词汇是有意义的应答/感叹，不是语气词，不能匹配：
+    #   うん(是)、ううん(不)、ええ(是)、はい(是)、いいえ(不)、
+    #   いや(不)、え(诶?)、あ(啊!)、えっ(诶?!)
+    #
+    # 语气词 = 只在说话犹豫/思考时发出的无意义填充音
+    r'えーっと'                # えーっと（思考中）
     r'|えっと[ー]?'            # えっと、えっとー
     r'|えーと'                 # えーと
-    r'|あの[ーう]?ね?'         # あの、あのー、あのう、あのね
-    r'|うーん+'                # うーん
-    r'|そうそう(?:そう)*'      # そうそう、そうそうそう（重复形のみ、単独「そう」は有意味）
-    r'|はいはい(?:はい)*'      # はいはい、はいはいはい（重複のみ、単独「はい」は有意味）
+    r'|あの[ーう]ね?'          # あのー、あのう、あのーね（★ 去掉「あの」单独匹配，它可能有意义）
+    r'|うーん+'                # うーん（犹豫，★ 注意不匹配「うん」=是）
+    r'|そうそう(?:そう)*'      # そうそう、そうそうそう（重复附和，単独「そう」有意义）
+    r'|はいはい(?:はい)*'      # はいはい、はいはいはい（敷衍附和，★ 単独「はい」=是，保留）
     r'|なんか'                 # なんか
-    r'|ほら(?:ほら)*'          # ほら、ほらほら
-    r'|こう'                   # こう
-    r'|[あぁ]+[ーっ]*'         # あ、ああ、あー、あっ
-    r'|[えぇ]+[ーっ]*'         # え、ええ、えー、えっ
-    r'|[うぅ]+[ーんっ]*'       # う、うー、うん、うっ
-    r'|[おぉ]+[ーっ]*'         # お、おー、おっ
-    r'|[んン]+[ーっ]*'         # ん、んー
-    r'|はぁ[ーっ]*'            # はぁ、はぁー（溜息、単独「は」は除外）
-    r'|ふ[ーんっ]+'            # ふーん、ふっ（ふ単独は除外）
-    r'|まぁ?[ーあぁ]+'         # まあ、まー、まぁ
-    r'|ねぇ?[ーえぇ]+'         # ねー、ねえ（ね単独は除外）
+    r'|ほら(?:ほら)+'          # ほらほら（重复才算语气词，★ 単独「ほら」=你看，保留）
+    r'|あー+'                  # あー、あーー（拉长才是语气词，★「あ」「あっ」是感叹，保留）
+    r'|えー+'                  # えー、えーー（拉长才是语气词，★「え」「えっ」是感叹，保留）
+    r'|うー+'                  # うー（犹豫声，★「うん」=是，保留）
+    r'|おー+'                  # おー（惊叹拉长，★「お」单独保留）
+    r'|[んン]ー+'              # んー（思考，★ 单独「ん」保留）
+    r'|はぁ[ーっ]+'            # はぁー（叹气拉长）
+    r'|ふーん+'                # ふーん（哦~）
+    r'|まぁ?[ーあぁ]+'         # まあ、まー、まぁ（嗯~）
+    r'|ねぇ?[ーえぇ]+'         # ねー、ねえ（语气拖长）
 )
 
 _JP_FILLER_SEP = r'[\s　、。]*'
@@ -1189,12 +1193,11 @@ def postprocess(segments: list[Segment], config: Config) -> list[Segment]:
 def merge_short_segments(segments: list[Segment], config: Config) -> list[Segment]:
     """智能合并碎片段 — 解决 condition_on_previous_text=False 导致的断句碎片化
 
-    合并策略（按优先级判断是否合并相邻段）：
-    1. ★ 未完句合并：前段不以句末标点结尾（。！？） → 强烈倾向合并
-       （间隔 < 1.5s 且合并后时长/文本不超限即合并）
-    2. 短段合并：前段或后段很短（< 3字）→ 倾向合并
-       （间隔 < 1.0s 且合并后不超限）
-    3. 常规合并：间隔 < merge_gap_threshold 且合并后不超长
+    合并策略（保守策略 — 避免误合不同说话人）：
+    1. 未完句合并：前段不以句末标点结尾 → 间隔 < 0.6s 才合并
+       （0.6s 以内通常是同一说话人的句子碎片，超过则可能是换人）
+    2. 短段合并：前段或后段 < 3字 → 间隔 < 0.5s 才合并
+    3. 常规合并：间隔 < merge_gap_threshold (0.3s)
     """
     if not segments:
         return segments
@@ -1213,30 +1216,30 @@ def merge_short_segments(segments: list[Segment], config: Config) -> list[Segmen
 
         # 合并后基本约束
         duration_ok = combined_duration <= config.max_segment_duration
-        text_ok = combined_text_len <= 60  # 日文一行字幕上限约 30 字，两行 60 字
+        text_ok = combined_text_len <= 50  # 日文一行字幕约 25 字，两行 50 字
 
         should_merge = False
 
-        # 策略1：未完句合并（最重要 — 前段不以句末标点结尾）
+        # 策略1：未完句合并 — 前段不以句末标点结尾
+        # ★ 间隔限制 0.6s（太大会合并不同说话人！1.5s→0.6s）
         prev_text_stripped = prev.text.rstrip()
         if prev_text_stripped and prev_text_stripped[-1] not in _SENTENCE_END:
-            if gap < 1.5 and duration_ok and text_ok:
+            if gap < 0.6 and duration_ok and text_ok:
                 should_merge = True
 
-        # 策略2：短段合并（<3字的碎片几乎不可能是完整句）
+        # 策略2：短段合并 — < 3字的碎片
+        # ★ 间隔限制 0.5s（1.0s→0.5s）
         if not should_merge and (len(prev.text.strip()) < 3 or len(seg.text.strip()) < 3):
-            if gap < 1.0 and duration_ok and text_ok:
+            if gap < 0.5 and duration_ok and text_ok:
                 should_merge = True
 
-        # 策略3：常规合并（间隔很小的相邻段）
+        # 策略3：常规合并 — 间隔极小的相邻段
         if not should_merge:
             if gap < config.merge_gap_threshold and duration_ok and combined_text_len <= 40:
                 should_merge = True
 
         if should_merge:
-            # 合并时添加适当连接
             prev.end = seg.end
-            # 如果前段以逗号结尾或后段以小写假名开头，直接拼接
             prev.text = prev.text + seg.text
             merge_count += 1
         else:
