@@ -63,11 +63,11 @@ class Config:
     language: str = "ja"
     beam_size: int = 10
     suppress_silence: bool = True
-    condition_on_previous_text: bool = True
+    condition_on_previous_text: bool = False  # ★ False 防止错误传播导致整段跳过，大幅提升召回率
     word_timestamps: bool = True
     vad_onset: float = 0.5
     vad_offset: float = 0.363
-    no_speech_threshold: float = 0.6
+    no_speech_threshold: float = 0.7          # 放宽：保留更多边界段（0.6→0.7）
     compression_ratio_threshold: float = 2.8   # 日文重复模式多，放宽（英文默认 2.4）
     logprob_threshold: float = -1.0
     temperature: tuple = (0.0, 0.2, 0.4, 0.6)  # 去掉 0.8/1.0 — 高温产出几乎全是幻觉
@@ -84,8 +84,8 @@ class Config:
 
     # --- 遗漏区域二次转录 ---
     retranscribe_missed: bool = True    # 对 VAD 检出但 Whisper 遗漏的区域自动二次转录
-    retranscribe_beam_size: int = 5     # 二次转录用较小 beam（更宽容 + 更快）
-    retranscribe_min_duration: float = 0.8  # 只重新转录时长 > 此值的遗漏区域
+    retranscribe_beam_size: int = 8     # 二次转录 beam（5→8，更彻底，显存充裕时值得）
+    retranscribe_min_duration: float = 0.5  # 只重新转录时长 > 此值的遗漏区域（0.8→0.5 捕捉短遗漏）
 
     # --- Demucs ---
     demucs_model: str = "htdemucs_ft"
@@ -137,7 +137,7 @@ class Config:
 
     # --- Silero VAD 交叉验证 ---
     vad_filter: bool = True             # 启用 Silero VAD 独立验证
-    vad_min_speech_ratio: float = 0.3   # 段内至少 30% 时间有语音才保留
+    vad_min_speech_ratio: float = 0.15  # 段内至少 15% 时间有语音才保留（0.3→0.15 减少误删）
     vad_threshold: float = 0.5          # VAD 语音检测灵敏度（0~1，越低越灵敏）
     vad_min_speech_ms: int = 250        # VAD 最短语音段 (ms)
     vad_min_silence_ms: int = 100       # VAD 最短静音段 (ms)
@@ -592,7 +592,7 @@ def detect_missed_speech(segments: list, speech_regions: list[tuple[float, float
                 coverage += o_end - o_start
 
         coverage_ratio = coverage / vad_duration
-        if coverage_ratio < 0.3:  # 不到 30% 被覆盖 → 可能遗漏
+        if coverage_ratio < 0.5:  # 不到 50% 被覆盖 → 可能遗漏（0.3→0.5 更敏感）
             missed.append((vad_start, vad_end))
 
     return missed
@@ -666,8 +666,8 @@ def print_coverage_report(segments: list, speech_regions: list[tuple[float, floa
 
         if recall < 0.85:
             logger.warning(f"   ⚠️  召回率偏低！有语音未被提取。")
-            logger.warning(f"      建议：1) 检查源视频语音清晰度  "
-                           f"2) 降低 --beam-size  3) 使用 --keep-temp 检查中间音频")
+            logger.warning(f"      建议：1) 使用 --keep-temp 检查中间音频  "
+                           f"2) 确认 Demucs 分离质量  3) 尝试 --backend whisper 对比")
         if precision < 0.70:
             logger.warning(f"   ⚠️  精确度偏低！可能有幻觉字幕。")
             logger.warning(f"      建议：1) 确认 Demucs 分离质量  2) 检查 BGM 泄漏")
@@ -1337,36 +1337,26 @@ def retranscribe_missed_regions(
 
         # 用不同参数转录
         try:
+            # ★ 二次转录参数策略：更宽容，更不容易跳过语音
+            retranscribe_kwargs = dict(
+                language=config.language,
+                beam_size=config.retranscribe_beam_size,
+                condition_on_previous_text=False,       # ★ 无上下文依赖
+                word_timestamps=config.word_timestamps,
+                initial_prompt=config.initial_prompt,
+                no_speech_threshold=0.8,                # ★ 更宽容（不轻易判定为"无语音"）
+                temperature=(0.0, 0.2, 0.4),            # ★ 多温度尝试
+                suppress_silence=config.suppress_silence,
+                vad=True,
+                vad_threshold=config.vad_onset,
+            )
+
             if actual_backend == "faster-whisper":
-                result = model.transcribe_stable(
-                    clip_path,
-                    language=config.language,
-                    beam_size=config.retranscribe_beam_size,
-                    condition_on_previous_text=False,   # ★ 关键：避免错误传播
-                    word_timestamps=config.word_timestamps,
-                    initial_prompt=config.initial_prompt,
-                    no_speech_threshold=min(config.no_speech_threshold + 0.1, 0.9),
-                    temperature=(0.0, 0.2),             # ★ 减少幻觉
-                    suppress_silence=config.suppress_silence,
-                    vad=True,
-                    vad_threshold=config.vad_onset,
-                )
+                result = model.transcribe_stable(clip_path, **retranscribe_kwargs)
             else:
                 use_fp16 = config.fp16 and config.device == "cuda"
-                result = model.transcribe(
-                    clip_path,
-                    language=config.language,
-                    beam_size=config.retranscribe_beam_size,
-                    condition_on_previous_text=False,
-                    word_timestamps=config.word_timestamps,
-                    initial_prompt=config.initial_prompt,
-                    no_speech_threshold=min(config.no_speech_threshold + 0.1, 0.9),
-                    temperature=(0.0, 0.2),
-                    suppress_silence=config.suppress_silence,
-                    fp16=use_fp16,
-                    vad=True,
-                    vad_threshold=config.vad_onset,
-                )
+                retranscribe_kwargs["fp16"] = use_fp16
+                result = model.transcribe(clip_path, **retranscribe_kwargs)
 
             # 提取有效段并调整时间戳
             for seg in result.segments:
