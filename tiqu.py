@@ -72,12 +72,12 @@ class Config:
     logprob_threshold: float = -1.0
     temperature: tuple = (0.0, 0.2, 0.4, 0.6)  # 去掉 0.8/1.0 — 高温产出几乎全是幻觉
     initial_prompt: str = (
-        # ★ 日本語特化 prompt — 对话风格引导 Whisper 进入"日语会话"模式
-        # 包含语气词（えっと/そうですね）和常见敬体，减少中文/英文幻觉
-        "こんにちは、よろしくお願いします。"
-        "えっと、そうですね、それでは始めましょう。"
-        "日本語の会話を正確に書き起こします。"
-        "句読点は「、」「。」を使い、「？」「！」も適宜使います。"
+        # ★ initial_prompt 必须是「看起来像真实对话」的日文
+        # 绝对不能包含指令性语句（如「正確に書き起こします」），否则 Whisper 会回吐到字幕里
+        # 用途：引导 Whisper 进入「日语日常会话」模式，减少中文/英文幻觉
+        "ああ、そうなんですか。へえ、それはすごいですね。"
+        "うん、分かった。じゃあ、やってみよう。"
+        "まあ、いいんじゃない？そういうこともあるよね。"
     )
     refine_timestamps: bool = True  # 是否使用 stable-ts refine 微调时间戳
     fp16: bool = True               # 仅原版 Whisper 使用，faster-whisper 用 compute_type
@@ -115,6 +115,11 @@ class Config:
         r"(.{2,})\1{3,}",                   # 重复字符串 ≥4 次（如「すすすす」）
         r"[♪♫🎵🎶♩♬]+",                      # 音乐符号
         r"^[\s　]*$",                         # 空白段
+        # ── Prompt Echo 幻觉（Whisper 回吐 initial_prompt）──
+        r"書き起こし",                        # 「転写」指令回吐
+        r"正確に.*ます",                      # 指令性语句
+        r"句読点",                            # 标点指令回吐
+        r"日本語の会話",                       # 旧 prompt 残留回吐
         # ── 日本語 Whisper 典型幻觉 ──
         r"ご視聴ありがとうございました",        # YouTube 结尾
         r"チャンネル登録",                     # YouTube 幻觉
@@ -980,12 +985,22 @@ def quality_check(segments: list[Segment], config: Config) -> list[Segment]:
         "零时长": 0,
         "重复文本": 0,
         "幻觉模式": 0,
+        "Prompt回吐": 0,
         "非日文内容": 0,
         "纯语气词": 0,
     }
 
     # --- 编译幻觉正则 ---
     hallucination_re = [re.compile(p) for p in config.hallucination_patterns]
+
+    # --- 提取 initial_prompt 中的短语用于 echo 检测 ---
+    prompt_phrases = []
+    if config.initial_prompt:
+        # 按句号分割 prompt，每个短语长度 ≥ 5 才有检测价值
+        for phrase in re.split(r'[。！？!?]+', config.initial_prompt):
+            phrase = phrase.strip()
+            if len(phrase) >= 5:
+                prompt_phrases.append(phrase)
 
     # --- 逐段检查 ---
     for i, seg in enumerate(segments):
@@ -1037,6 +1052,17 @@ def quality_check(segments: list[Segment], config: Config) -> list[Segment]:
         if is_hallucination:
             removed_reasons["幻觉模式"] += 1
             logger.info(f"   ✗ [幻觉] {seg.start:.1f}-{seg.end:.1f}s: {text[:40]}")
+            continue
+
+        # 7.5 Prompt Echo 检测 — initial_prompt 回吐到字幕
+        is_prompt_echo = False
+        for phrase in prompt_phrases:
+            if phrase in text:
+                is_prompt_echo = True
+                break
+        if is_prompt_echo:
+            removed_reasons["Prompt回吐"] += 1
+            logger.info(f"   ✗ [Prompt回吐] {seg.start:.1f}-{seg.end:.1f}s: {text[:40]}")
             continue
 
         # 8. 日文内容验证 — 纯英文/纯中文（无假名）/乱码 → 非日语

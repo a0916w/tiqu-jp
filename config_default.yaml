@@ -27,6 +27,8 @@ temperature: [0.0, 0.2, 0.4, 0.6]
 suppress_silence: true
 vad_onset: 0.35
 vad_offset: 0.2
+# ★ initial_prompt 只用纯对话文本，绝不放指令性语句（否则 Whisper 会回吐到字幕里）
+initial_prompt: "ああ、そうなんですか。へえ、それはすごいですね。うん、分かった。じゃあ、やってみよう。"
 
 # --- Demucs 人声分离 ---
 demucs_shifts: 2
