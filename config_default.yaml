@@ -20,23 +20,27 @@ fp16: true                       # 原版 whisper 用
 beam_size: 10
 condition_on_previous_text: false # ★ false 防止错误传播，大幅提升召回率
 word_timestamps: true
-no_speech_threshold: 0.7         # 放宽：0.6→0.7 保留更多边界段
-compression_ratio_threshold: 2.8
+no_speech_threshold: 0.7         # 放宽保留更多边界段
+compression_ratio_threshold: 3.2 # 日文敬语/重复表达多，放宽
 logprob_threshold: -1.0
 temperature: [0.0, 0.2, 0.4, 0.6]
 suppress_silence: true
+max_chars_per_second: 18.0       # 快节奏内容需要更宽
 initial_prompt: "これは日本語の会話です。日常会話、アニメ、ドラマ、映画のセリフを正確に書き起こしてください。"
 
 # --- Demucs 人声分离 ---
-demucs_shifts: 1                 # 1=标准(快)  2=高质量(推荐)  5=极致
+demucs_shifts: 2                 # 2=推荐平衡  1=快速  5=极致
 demucs_segment: null             # null=整曲处理（24GB 足够）
 demucs_overlap: 0.25
 
 # --- Silero VAD 验证 ---
 vad_filter: true
 vad_min_speech_ratio: 0.15       # 段内至少 15% 有语音即保留
+vad_threshold: 0.35              # VAD 灵敏度（更低=更灵敏）
 vad_onset: 0.35
-vad_offset: 0.15
+vad_offset: 0.2
+vad_min_speech_ms: 200
+vad_min_silence_ms: 80
 
 # --- 遗漏区域二次转录 ---
 retranscribe_missed: true

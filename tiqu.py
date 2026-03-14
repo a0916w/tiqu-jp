@@ -65,10 +65,10 @@ class Config:
     suppress_silence: bool = True
     condition_on_previous_text: bool = False  # ★ False 防止错误传播导致整段跳过，大幅提升召回率
     word_timestamps: bool = True
-    vad_onset: float = 0.5
-    vad_offset: float = 0.363
+    vad_onset: float = 0.35          # Whisper 内部 VAD 灵敏度（0.5→0.35 更灵敏）
+    vad_offset: float = 0.2           # 语音结束判定（更宽松，不过早截断）
     no_speech_threshold: float = 0.7          # 放宽：保留更多边界段（0.6→0.7）
-    compression_ratio_threshold: float = 2.8   # 日文重复模式多，放宽（英文默认 2.4）
+    compression_ratio_threshold: float = 3.2   # 日文重复模式多，再放宽（2.8→3.2，敬语/重复表达多）
     logprob_threshold: float = -1.0
     temperature: tuple = (0.0, 0.2, 0.4, 0.6)  # 去掉 0.8/1.0 — 高温产出几乎全是幻觉
     initial_prompt: str = (
@@ -90,7 +90,7 @@ class Config:
     # --- Demucs ---
     demucs_model: str = "htdemucs_ft"
     skip_demucs: bool = False
-    demucs_shifts: int = 1          # 随机偏移次数（越高质量越好，速度越慢。GPU 充裕可设 2~5）
+    demucs_shifts: int = 2          # 随机偏移次数（2=推荐平衡，A5000 显存充裕）
     demucs_overlap: float = 0.25    # 分段处理的重叠比例
     demucs_segment: Optional[int] = None  # 分段长度（秒），None=不分段。显存不够时设 40~60
 
@@ -104,7 +104,7 @@ class Config:
     # --- 质量检查（日本語特化） ---
     # 日本語は1文字あたりの情報量が多い（漢字+假名混合）
     # 一般会話: 5~10 文字/秒, アナウンサー: ~13 文字/秒, 上限 15 で幻覚を検出
-    max_chars_per_second: float = 15.0   # 日文每秒最大字符数（超过此值基本是幻觉）
+    max_chars_per_second: float = 18.0   # 日文每秒最大字符数（15→18，快节奏动画/综艺需要更宽）
     min_segment_duration: float = 0.3    # 最短段时长 (秒)
     max_segment_duration: float = 8.0    # 最长段时长 (秒)
     min_display_duration: float = 0.5    # 最短显示保底 (秒)
@@ -138,9 +138,9 @@ class Config:
     # --- Silero VAD 交叉验证 ---
     vad_filter: bool = True             # 启用 Silero VAD 独立验证
     vad_min_speech_ratio: float = 0.15  # 段内至少 15% 时间有语音才保留（0.3→0.15 减少误删）
-    vad_threshold: float = 0.5          # VAD 语音检测灵敏度（0~1，越低越灵敏）
-    vad_min_speech_ms: int = 250        # VAD 最短语音段 (ms)
-    vad_min_silence_ms: int = 100       # VAD 最短静音段 (ms)
+    vad_threshold: float = 0.35         # Silero VAD 灵敏度（0.5→0.35 检出更多低音量语音）
+    vad_min_speech_ms: int = 200        # VAD 最短语音段 (ms)（250→200 捕捉短句）
+    vad_min_silence_ms: int = 80        # VAD 最短静音段 (ms)（100→80 减少语音碎片化）
 
     # --- 输出 ---
     output_formats: list = field(default_factory=lambda: ["vtt"])
@@ -552,8 +552,11 @@ def vad_validate(segments: list, speech_regions: list[tuple[float, float]],
         for ex in vad_filtered_examples:
             logger.info(ex)
 
-    # === 遗漏检测 ===
-    missed = detect_missed_speech(validated, speech_regions)
+    # === 遗漏检测（使用 config 的 min_duration） ===
+    missed = detect_missed_speech(
+        validated, speech_regions,
+        min_duration=config.retranscribe_min_duration,
+    )
     if missed:
         logger.warning(f"   ⚠️  检测到 {len(missed)} 个可能遗漏的语音区域：")
         for start, end in missed[:10]:
@@ -1004,19 +1007,19 @@ def quality_check(segments: list[Segment], config: Config) -> list[Segment]:
         # 3. 无语音概率
         if seg.no_speech_prob > config.no_speech_threshold:
             removed_reasons["无语音概率过高"] += 1
-            logger.debug(f"   过滤 [no_speech={seg.no_speech_prob:.2f}]: {text[:30]}")
+            logger.info(f"   ✗ [no_speech={seg.no_speech_prob:.2f}] {seg.start:.1f}-{seg.end:.1f}s: {text[:40]}")
             continue
 
         # 4. 压缩比（幻觉指标）
         if seg.compression_ratio > config.compression_ratio_threshold:
             removed_reasons["压缩比过高"] += 1
-            logger.debug(f"   过滤 [compression={seg.compression_ratio:.2f}]: {text[:30]}")
+            logger.info(f"   ✗ [compress={seg.compression_ratio:.2f}] {seg.start:.1f}-{seg.end:.1f}s: {text[:40]}")
             continue
 
         # 5. 对数概率
         if seg.confidence < config.logprob_threshold:
             removed_reasons["对数概率过低"] += 1
-            logger.debug(f"   过滤 [logprob={seg.confidence:.2f}]: {text[:30]}")
+            logger.info(f"   ✗ [logprob={seg.confidence:.2f}] {seg.start:.1f}-{seg.end:.1f}s: {text[:40]}")
             continue
 
         # 6. 字符速率异常
@@ -1024,7 +1027,7 @@ def quality_check(segments: list[Segment], config: Config) -> list[Segment]:
         chars_per_sec = char_count / max(duration, 0.01)
         if chars_per_sec > config.max_chars_per_second:
             removed_reasons["字符速率异常"] += 1
-            logger.debug(f"   过滤 [cps={chars_per_sec:.1f}]: {text[:30]}")
+            logger.info(f"   ✗ [cps={chars_per_sec:.1f}] {seg.start:.1f}-{seg.end:.1f}s: {text[:40]}")
             continue
 
         # 7. 幻觉模式匹配
@@ -1035,19 +1038,19 @@ def quality_check(segments: list[Segment], config: Config) -> list[Segment]:
                 break
         if is_hallucination:
             removed_reasons["幻觉模式"] += 1
-            logger.debug(f"   过滤 [幻觉模式]: {text[:30]}")
+            logger.info(f"   ✗ [幻觉] {seg.start:.1f}-{seg.end:.1f}s: {text[:40]}")
             continue
 
         # 8. 日文内容验证 — 纯英文/纯中文（无假名）/乱码 → 非日语
         if not is_japanese_text(text):
             removed_reasons["非日文内容"] += 1
-            logger.debug(f"   过滤 [非日文]: {text[:30]}")
+            logger.info(f"   ✗ [非日文] {seg.start:.1f}-{seg.end:.1f}s: {text[:40]}")
             continue
 
         # 9. 纯语气词段 — あー/えっと/うーん 等无意义内容
         if config.strip_fillers and is_filler_only(text):
             removed_reasons["纯语气词"] += 1
-            logger.debug(f"   过滤 [语气词]: {text[:30]}")
+            logger.info(f"   ✗ [语气词] {seg.start:.1f}-{seg.end:.1f}s: {text[:40]}")
             continue
 
         filtered.append(seg)
@@ -1311,8 +1314,8 @@ def retranscribe_missed_regions(
     actual_backend = _whisper_backend or config.backend
 
     for i, (start, end) in enumerate(_progress(merged, desc="   🔄 二次转录", unit="段")):
-        # 添加上下文填充 (0.3s 每侧)
-        pad = 0.3
+        # 添加上下文填充（每侧 0.5s，给 Whisper 更多上下文以提高识别率）
+        pad = 0.5
         padded_start = max(0, start - pad)
         padded_end = end + pad
         duration = padded_end - padded_start
