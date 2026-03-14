@@ -63,7 +63,8 @@ import torch
 assert torch.cuda.is_available(), 'CUDA 不可用！'
 print(f'   ✅ PyTorch {torch.__version__} + CUDA {torch.version.cuda}')
 print(f'   ✅ GPU: {torch.cuda.get_device_name(0)}')
-print(f'   ✅ VRAM: {torch.cuda.get_device_properties(0).total_mem / (1024**3):.1f}GB')
+p=torch.cuda.get_device_properties(0); vram=getattr(p,'total_memory',getattr(p,'total_mem',0))
+print(f'   ✅ VRAM: {vram/(1024**3):.1f}GB')
 "
 fi
 
@@ -128,7 +129,11 @@ print(f'   Python:           {sys.version.split()[0]}')
 print(f'   PyTorch:          {torch.__version__}')
 print(f'   CUDA:             {torch.version.cuda if torch.cuda.is_available() else \"N/A\"}')
 print(f'   GPU:              {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')
-print(f'   VRAM:             {torch.cuda.get_device_properties(0).total_mem / (1024**3):.1f}GB' if torch.cuda.is_available() else '   VRAM:             N/A')
+if torch.cuda.is_available():
+    _p=torch.cuda.get_device_properties(0); _v=getattr(_p,'total_memory',getattr(_p,'total_mem',0))
+    print(f'   VRAM:          {_v/(1024**3):.1f}GB')
+else:
+    print('   VRAM:          N/A')
 print(f'   stable-ts:        {stable_whisper.__version__}')
 
 try:

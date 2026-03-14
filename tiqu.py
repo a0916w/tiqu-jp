@@ -191,7 +191,8 @@ def detect_devices() -> tuple[str, str]:
     import torch
     if torch.cuda.is_available():
         name = torch.cuda.get_device_name(0)
-        vram = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
+        props = torch.cuda.get_device_properties(0)
+        vram = getattr(props, 'total_memory', getattr(props, 'total_mem', 0)) / (1024 ** 3)
         logger.info(f"✅ 检测到 CUDA GPU: {name} ({vram:.1f}GB VRAM)")
         # 显示 CUDA 版本信息
         logger.info(f"   CUDA 版本: {torch.version.cuda}, cuDNN: {torch.backends.cudnn.version()}")
@@ -1965,7 +1966,8 @@ def _print_system_info(config: Config):
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
         logger.info(f"   GPU: {props.name}")
-        logger.info(f"   VRAM: {props.total_mem / (1024**3):.1f}GB")
+        _vram = getattr(props, 'total_memory', getattr(props, 'total_mem', 0))
+        logger.info(f"   VRAM: {_vram / (1024**3):.1f}GB")
         logger.info(f"   CUDA: {torch.version.cuda}")
     logger.info(f"   后端: {config.backend} | 模型: {config.model}")
     if config.backend == "faster-whisper":
