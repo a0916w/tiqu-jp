@@ -1085,9 +1085,8 @@ def postprocess(segments: list[Segment], config: Config) -> list[Segment]:
     logger.info("✂️  Step 6 — 后处理...")
     before_count = len(segments)
 
-    # 1. 合并过短的相邻段（间隔小于阈值且合并后不超长）
+    # 1. 智能合并碎片段（未完句 + 短段 + 间隔合并）
     segments = merge_short_segments(segments, config)
-    logger.debug(f"   合并短段后: {len(segments)} 段")
 
     # 2. 拆分过长段
     result = []
@@ -1162,26 +1161,63 @@ def postprocess(segments: list[Segment], config: Config) -> list[Segment]:
 
 
 def merge_short_segments(segments: list[Segment], config: Config) -> list[Segment]:
-    """合并相邻的短段：如果两段间隔小且合并后不超长，则合并"""
+    """智能合并碎片段 — 解决 condition_on_previous_text=False 导致的断句碎片化
+
+    合并策略（按优先级判断是否合并相邻段）：
+    1. ★ 未完句合并：前段不以句末标点结尾（。！？） → 强烈倾向合并
+       （间隔 < 1.5s 且合并后时长/文本不超限即合并）
+    2. 短段合并：前段或后段很短（< 3字）→ 倾向合并
+       （间隔 < 1.0s 且合并后不超限）
+    3. 常规合并：间隔 < merge_gap_threshold 且合并后不超长
+    """
     if not segments:
         return segments
 
+    # 日文句末标点（表示句子已完整）
+    _SENTENCE_END = set("。！？!?…")
+
     merged = [segments[0]]
+    merge_count = 0
+
     for seg in segments[1:]:
         prev = merged[-1]
         gap = seg.start - prev.end
         combined_duration = seg.end - prev.start
         combined_text_len = len(prev.text) + len(seg.text)
 
-        # 合并条件：间隔小 + 合并后不超长 + 合并后文本不太长
-        if (gap < config.merge_gap_threshold
-                and combined_duration <= config.max_segment_duration
-                and combined_text_len <= 40):
-            # 合并
+        # 合并后基本约束
+        duration_ok = combined_duration <= config.max_segment_duration
+        text_ok = combined_text_len <= 60  # 日文一行字幕上限约 30 字，两行 60 字
+
+        should_merge = False
+
+        # 策略1：未完句合并（最重要 — 前段不以句末标点结尾）
+        prev_text_stripped = prev.text.rstrip()
+        if prev_text_stripped and prev_text_stripped[-1] not in _SENTENCE_END:
+            if gap < 1.5 and duration_ok and text_ok:
+                should_merge = True
+
+        # 策略2：短段合并（<3字的碎片几乎不可能是完整句）
+        if not should_merge and (len(prev.text.strip()) < 3 or len(seg.text.strip()) < 3):
+            if gap < 1.0 and duration_ok and text_ok:
+                should_merge = True
+
+        # 策略3：常规合并（间隔很小的相邻段）
+        if not should_merge:
+            if gap < config.merge_gap_threshold and duration_ok and combined_text_len <= 40:
+                should_merge = True
+
+        if should_merge:
+            # 合并时添加适当连接
             prev.end = seg.end
+            # 如果前段以逗号结尾或后段以小写假名开头，直接拼接
             prev.text = prev.text + seg.text
+            merge_count += 1
         else:
             merged.append(seg)
+
+    if merge_count:
+        logger.info(f"   🔗 智能合并: {merge_count} 次合并 ({len(segments)} → {len(merged)} 段)")
 
     return merged
 
