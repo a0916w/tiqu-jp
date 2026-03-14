@@ -67,8 +67,8 @@ class Config:
     word_timestamps: bool = True
     vad_onset: float = 0.35          # Whisper 内部 VAD 灵敏度（0.5→0.35 更灵敏）
     vad_offset: float = 0.2           # 语音结束判定（更宽松，不过早截断）
-    no_speech_threshold: float = 0.7          # 放宽：保留更多边界段（0.6→0.7）
-    compression_ratio_threshold: float = 3.2   # 日文重复模式多，再放宽（2.8→3.2，敬语/重复表达多）
+    no_speech_threshold: float = 0.6          # 恢复 0.6（0.7 导致精确度下降且召回无明显提升）
+    compression_ratio_threshold: float = 2.8   # 日文重复模式多（英文默认 2.4）
     logprob_threshold: float = -1.0
     temperature: tuple = (0.0, 0.2, 0.4, 0.6)  # 去掉 0.8/1.0 — 高温产出几乎全是幻觉
     initial_prompt: str = (
@@ -104,7 +104,7 @@ class Config:
     # --- 质量检查（日本語特化） ---
     # 日本語は1文字あたりの情報量が多い（漢字+假名混合）
     # 一般会話: 5~10 文字/秒, アナウンサー: ~13 文字/秒, 上限 15 で幻覚を検出
-    max_chars_per_second: float = 18.0   # 日文每秒最大字符数（15→18，快节奏动画/综艺需要更宽）
+    max_chars_per_second: float = 15.0   # 日文每秒最大字符数（超过此值基本是幻觉）
     min_segment_duration: float = 0.3    # 最短段时长 (秒)
     max_segment_duration: float = 8.0    # 最长段时长 (秒)
     min_display_duration: float = 0.5    # 最短显示保底 (秒)
@@ -138,9 +138,9 @@ class Config:
     # --- Silero VAD 交叉验证 ---
     vad_filter: bool = True             # 启用 Silero VAD 独立验证
     vad_min_speech_ratio: float = 0.15  # 段内至少 15% 时间有语音才保留（0.3→0.15 减少误删）
-    vad_threshold: float = 0.35         # Silero VAD 灵敏度（0.5→0.35 检出更多低音量语音）
-    vad_min_speech_ms: int = 200        # VAD 最短语音段 (ms)（250→200 捕捉短句）
-    vad_min_silence_ms: int = 80        # VAD 最短静音段 (ms)（100→80 减少语音碎片化）
+    vad_threshold: float = 0.5          # Silero VAD 灵敏度（恢复 0.5，过低会把噪音当语音）
+    vad_min_speech_ms: int = 250        # VAD 最短语音段 (ms)
+    vad_min_silence_ms: int = 100       # VAD 最短静音段 (ms)
 
     # --- 用户自定义替换词典（ASR 纠错） ---
     corrections: dict = field(default_factory=dict)  # {"误识别": "正确写法", ...}
@@ -519,20 +519,19 @@ def vad_validate(segments: list, speech_regions: list[tuple[float, float]],
                  config: Config) -> list:
     """用 Silero VAD 结果交叉验证 Whisper 字幕段
 
-    双重保障：
-    1. 过滤幻觉 — Whisper 输出字幕但 VAD 认为无语音 → 删除
-    2. 检测遗漏 — VAD 检测到语音但 Whisper 没有对应字幕 → 警告
+    ★ 策略：只补不删
+    - Whisper 产出的段一律保留（信任 ASR，不因 VAD 误判删除真实台词）
+    - VAD 仅用于检测 Whisper 遗漏的语音区域（供二次转录使用）
+    - 对 VAD 认为无语音的 Whisper 段只做日志标记，不删除
     """
     if not speech_regions:
         logger.info("   ⏭️ 无 VAD 数据，跳过交叉验证")
         return segments
 
-    logger.info("🔍 VAD 交叉验证字幕段...")
+    logger.info("🔍 VAD 交叉验证字幕段（只补不删模式）...")
 
-    validated = []
-    vad_filtered_count = 0
-    vad_filtered_examples = []
-
+    # ★ 不再删除任何段，仅记录 VAD 认为可疑的段供参考
+    vad_suspicious_count = 0
     for seg in segments:
         duration = seg.end - seg.start
         if duration <= 0:
@@ -541,24 +540,19 @@ def vad_validate(segments: list, speech_regions: list[tuple[float, float]],
         overlap = compute_speech_overlap(seg.start, seg.end, speech_regions)
         ratio = overlap / duration
 
-        if ratio >= config.vad_min_speech_ratio:
-            validated.append(seg)
-        else:
-            vad_filtered_count += 1
-            if len(vad_filtered_examples) < 5:
-                vad_filtered_examples.append(
-                    f"     {format_time_vtt(seg.start)}→{format_time_vtt(seg.end)} "
-                    f"[speech={ratio:.0%}] {seg.text[:40]}"
-                )
+        if ratio < config.vad_min_speech_ratio:
+            vad_suspicious_count += 1
+            logger.debug(
+                f"   ⚠️ VAD 可疑（但保留）: {format_time_vtt(seg.start)}→"
+                f"{format_time_vtt(seg.end)} [speech={ratio:.0%}] {seg.text[:40]}"
+            )
 
-    if vad_filtered_count:
-        logger.info(f"   🗑️  VAD 过滤了 {vad_filtered_count} 个无语音段（幻觉）")
-        for ex in vad_filtered_examples:
-            logger.info(ex)
+    if vad_suspicious_count:
+        logger.info(f"   ℹ️  {vad_suspicious_count} 段 VAD 覆盖率低（已保留，仅供参考）")
 
     # === 遗漏检测（使用 config 的 min_duration） ===
     missed = detect_missed_speech(
-        validated, speech_regions,
+        segments, speech_regions,
         min_duration=config.retranscribe_min_duration,
     )
     if missed:
@@ -573,8 +567,8 @@ def vad_validate(segments: list, speech_regions: list[tuple[float, float]],
     else:
         logger.info("   ✅ 未检测到遗漏的语音区域")
 
-    logger.info(f"   验证后保留: {len(validated)}/{len(segments)} 段")
-    return validated
+    logger.info(f"   保留全部 {len(segments)} 段")
+    return segments
 
 
 def detect_missed_speech(segments: list, speech_regions: list[tuple[float, float]],

@@ -1,51 +1,48 @@
 # ═══════════════════════════════════════════════════════════════
-# tiqu-jp 默认配置（日语字幕提取 — 召回率优先）
+# tiqu-jp 默认配置（日语字幕提取）
 # ═══════════════════════════════════════════════════════════════
 #
 # 用法:
 #   python3 tiqu.py video.mp4 --config config_default.yaml
 #
-# 你可以复制此文件，修改后用 --config 指定。
 # CLI 参数会覆盖 YAML 中的同名配置。
 # ═══════════════════════════════════════════════════════════════
 
 # --- 基础设置 ---
 language: "ja"
 model_name: "large-v3"
-backend: "faster-whisper"        # "faster-whisper" 或 "whisper"
-compute_type: "float16"          # faster-whisper: float16/int8_float16/int8
-fp16: true                       # 原版 whisper 用
+backend: "faster-whisper"
+compute_type: "float16"
+fp16: true
 
 # --- Whisper 转录参数 ---
 beam_size: 10
-condition_on_previous_text: false # ★ false 防止错误传播，大幅提升召回率
+condition_on_previous_text: false # ★ 防止错误传播跳段
 word_timestamps: true
-no_speech_threshold: 0.7         # 放宽保留更多边界段
-compression_ratio_threshold: 3.2 # 日文敬语/重复表达多，放宽
+no_speech_threshold: 0.6
+compression_ratio_threshold: 2.8
 logprob_threshold: -1.0
+max_chars_per_second: 15.0
 temperature: [0.0, 0.2, 0.4, 0.6]
 suppress_silence: true
-max_chars_per_second: 18.0       # 快节奏内容需要更宽
-initial_prompt: "これは日本語の会話です。日常会話、アニメ、ドラマ、映画のセリフを正確に書き起こしてください。"
-
-# --- Demucs 人声分离 ---
-demucs_shifts: 2                 # 2=推荐平衡  1=快速  5=极致
-demucs_segment: null             # null=整曲处理（24GB 足够）
-demucs_overlap: 0.25
-
-# --- Silero VAD 验证 ---
-vad_filter: true
-vad_min_speech_ratio: 0.15       # 段内至少 15% 有语音即保留
-vad_threshold: 0.35              # VAD 灵敏度（更低=更灵敏）
 vad_onset: 0.35
 vad_offset: 0.2
-vad_min_speech_ms: 200
-vad_min_silence_ms: 80
+
+# --- Demucs 人声分离 ---
+demucs_shifts: 2
+demucs_segment: null
+demucs_overlap: 0.25
+
+# --- Silero VAD（只补不删模式） ---
+vad_filter: true
+vad_threshold: 0.5
+vad_min_speech_ms: 250
+vad_min_silence_ms: 100
 
 # --- 遗漏区域二次转录 ---
 retranscribe_missed: true
 retranscribe_beam_size: 8
-retranscribe_min_duration: 0.5   # 0.5s 以上的遗漏区域均重新转录
+retranscribe_min_duration: 0.5
 
 # --- 后处理 ---
 min_segment_duration: 0.3
