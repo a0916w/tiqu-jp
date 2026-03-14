@@ -524,40 +524,87 @@ def vad_validate(segments: list, speech_regions: list[tuple[float, float]],
                  config: Config) -> list:
     """用 Silero VAD 结果交叉验证 Whisper 字幕段
 
-    ★ 策略：只补不删
-    - Whisper 产出的段一律保留（信任 ASR，不因 VAD 误判删除真实台词）
-    - VAD 仅用于检测 Whisper 遗漏的语音区域（供二次转录使用）
-    - 对 VAD 认为无语音的 Whisper 段只做日志标记，不删除
+    ★ 策略：保守删除 + 连锁检测
+    1. 对每段计算 VAD 语音重叠比例
+    2. 重叠 = 0%（完全无语音）→ 标记为幻觉候选
+    3. 连续 2+ 段 0% 重叠 → 几乎确定是幻觉链（静音场景乱输出），直接删除
+    4. 孤立的 0% 段，若 < 2s 也删除（短幻觉）
+    5. 有任何 VAD 重叠的段 → 保留（即使重叠低，也可能是真实语音）
     """
     if not speech_regions:
         logger.info("   ⏭️ 无 VAD 数据，跳过交叉验证")
         return segments
 
-    logger.info("🔍 VAD 交叉验证字幕段（只补不删模式）...")
+    logger.info("🔍 VAD 交叉验证字幕段（保守删除 + 连锁检测）...")
 
-    # ★ 不再删除任何段，仅记录 VAD 认为可疑的段供参考
-    vad_suspicious_count = 0
+    # ── Step 1: 计算每段的 VAD 重叠比例 ──
+    overlap_ratios = []
     for seg in segments:
         duration = seg.end - seg.start
         if duration <= 0:
+            overlap_ratios.append(0.0)
             continue
-
         overlap = compute_speech_overlap(seg.start, seg.end, speech_regions)
-        ratio = overlap / duration
+        overlap_ratios.append(overlap / duration)
 
-        if ratio < config.vad_min_speech_ratio:
-            vad_suspicious_count += 1
-            logger.debug(
-                f"   ⚠️ VAD 可疑（但保留）: {format_time_vtt(seg.start)}→"
-                f"{format_time_vtt(seg.end)} [speech={ratio:.0%}] {seg.text[:40]}"
-            )
+    # ── Step 2: 标记需要删除的段 ──
+    n = len(segments)
+    to_remove = set()
 
-    if vad_suspicious_count:
-        logger.info(f"   ℹ️  {vad_suspicious_count} 段 VAD 覆盖率低（已保留，仅供参考）")
+    # 检测连续零重叠链（幻觉链）
+    i = 0
+    while i < n:
+        if overlap_ratios[i] < 0.05:  # < 5% 视为零
+            # 找到连续零重叠段的结束位置
+            chain_start = i
+            while i < n and overlap_ratios[i] < 0.05:
+                i += 1
+            chain_len = i - chain_start
 
-    # === 遗漏检测（使用 config 的 min_duration） ===
+            if chain_len >= 2:
+                # ★ 连续 2+ 段零重叠 → 幻觉链，全部删除
+                for j in range(chain_start, i):
+                    to_remove.add(j)
+                    logger.info(
+                        f"   🚫 幻觉链删除: {format_time_vtt(segments[j].start)}→"
+                        f"{format_time_vtt(segments[j].end)} "
+                        f"[speech={overlap_ratios[j]:.0%}] {segments[j].text[:40]}"
+                    )
+            else:
+                # 孤立的零重叠段
+                seg = segments[chain_start]
+                duration = seg.end - seg.start
+                if duration < 2.0:
+                    # ★ 短段零重叠 → 可能是幻觉
+                    to_remove.add(chain_start)
+                    logger.info(
+                        f"   🚫 零语音短段删除: {format_time_vtt(seg.start)}→"
+                        f"{format_time_vtt(seg.end)} "
+                        f"[{duration:.1f}s, speech={overlap_ratios[chain_start]:.0%}] "
+                        f"{seg.text[:40]}"
+                    )
+                else:
+                    # 孤立 + 较长 → 保留（可能是 VAD 漏检）
+                    logger.debug(
+                        f"   ⚠️ VAD 可疑（保留）: {format_time_vtt(seg.start)}→"
+                        f"{format_time_vtt(seg.end)} "
+                        f"[{duration:.1f}s, speech={overlap_ratios[chain_start]:.0%}] "
+                        f"{seg.text[:40]}"
+                    )
+        else:
+            i += 1
+
+    # ── Step 3: 执行删除 ──
+    if to_remove:
+        filtered = [seg for idx, seg in enumerate(segments) if idx not in to_remove]
+        logger.info(f"   🗑️ VAD 删除了 {len(to_remove)} 段幻觉/无语音字幕")
+    else:
+        filtered = segments
+        logger.info("   ✅ 未检测到幻觉字幕")
+
+    # ── Step 4: 遗漏检测 ──
     missed = detect_missed_speech(
-        segments, speech_regions,
+        filtered, speech_regions,
         min_duration=config.retranscribe_min_duration,
     )
     if missed:
@@ -572,8 +619,8 @@ def vad_validate(segments: list, speech_regions: list[tuple[float, float]],
     else:
         logger.info("   ✅ 未检测到遗漏的语音区域")
 
-    logger.info(f"   保留全部 {len(segments)} 段")
-    return segments
+    logger.info(f"   保留 {len(filtered)} / {len(segments)} 段")
+    return filtered
 
 
 def detect_missed_speech(segments: list, speech_regions: list[tuple[float, float]],
@@ -836,29 +883,34 @@ class Segment:
 
 # 语气词单元正则（长模式在前防止短模式贪婪匹配）
 _JP_FILLER = (
-    # ★ 注意：以下词汇是有意义的应答/感叹，不是语气词，不能匹配：
-    #   うん(是)、ううん(不)、ええ(是)、はい(是)、いいえ(不)、
-    #   いや(不)、え(诶?)、あ(啊!)、えっ(诶?!)
+    # ★ 保留的有意义应答（不匹配）：
+    #   うん(是)、ううん(不)、ええ(是)、はい(是)、いいえ(不)、いや(不)、そう(对)
     #
-    # 语气词 = 只在说话犹豫/思考时发出的无意义填充音
+    # 删除的 = 字幕上不需要的单字感叹 + 犹豫/思考填充音
     r'えーっと'                # えーっと（思考中）
     r'|えっと[ー]?'            # えっと、えっとー
     r'|えーと'                 # えーと
-    r'|あの[ーう]ね?'          # あのー、あのう、あのーね（★ 去掉「あの」单独匹配，它可能有意义）
-    r'|うーん+'                # うーん（犹豫，★ 注意不匹配「うん」=是）
-    r'|そうそう(?:そう)*'      # そうそう、そうそうそう（重复附和，単独「そう」有意义）
-    r'|はいはい(?:はい)*'      # はいはい、はいはいはい（敷衍附和，★ 単独「はい」=是，保留）
+    r'|あの[ーう]ね?'          # あのー、あのう、あのーね
+    r'|うーん+'                # うーん（犹豫）
+    r'|そうそう(?:そう)*'      # そうそう（重复附和）
+    r'|はいはい(?:はい)*'      # はいはい（敷衍附和）
     r'|なんか'                 # なんか
-    r'|ほら(?:ほら)+'          # ほらほら（重复才算语气词，★ 単独「ほら」=你看，保留）
-    r'|あー+'                  # あー、あーー（拉长才是语气词，★「あ」「あっ」是感叹，保留）
-    r'|えー+'                  # えー、えーー（拉长才是语气词，★「え」「えっ」是感叹，保留）
-    r'|うー+'                  # うー（犹豫声，★「うん」=是，保留）
-    r'|おー+'                  # おー（惊叹拉长，★「お」单独保留）
-    r'|[んン]ー+'              # んー（思考，★ 单独「ん」保留）
-    r'|はぁ[ーっ]+'            # はぁー（叹气拉长）
-    r'|ふーん+'                # ふーん（哦~）
-    r'|まぁ?[ーあぁ]+'         # まあ、まー、まぁ（嗯~）
-    r'|ねぇ?[ーえぇ]+'         # ねー、ねえ（语气拖长）
+    r'|ほら(?:ほら)+'          # ほらほら
+    # ── 单字/短感叹（字幕上不需要）──
+    r'|[あぁ]+[ーっ]*'         # あ、ああ、あっ、あー
+    r'|[えぇ]+[ーっ]*'         # え、えっ、えー（★ ええ 由下面排除）
+    r'|[おぉ]+[ーっ]*'         # お、おっ、おー
+    r'|[うぅ]+[ーっ]+'         # うー、うっ（★ 注意不匹配「うん」=是）
+    r'|[んン]+[ーっ]*'         # ん、んー
+    r'|はぁ[ーっ]*'            # はぁ、はぁー（叹气）
+    r'|ふ[ーんっ]+'            # ふーん、ふっ
+    r'|まぁ?[ーあぁ]+'         # まあ、まー
+    r'|ねぇ?[ーえぇ]+'         # ねー、ねえ
+)
+
+# ★「ええ」是肯定应答（=はい），不是语气词，需要排除
+_JP_MEANINGFUL_RESPONSES = re.compile(
+    r'^(?:うん|ううん|ええ|はい|いいえ|いや|そう|ほら|あの)$'
 )
 
 _JP_FILLER_SEP = r'[\s　、。]*'
@@ -882,13 +934,18 @@ _JP_FILLER_SUFFIX_RE = re.compile(
 
 
 def is_filler_only(text: str) -> bool:
-    """检查整段是否只由无意义语气词构成
+    """检查整段是否只由无意义语气词构成（排除有意义的应答词）
 
-    例: 「あー」「えっと」「うーん、あー」 → True
+    True:  「あー」「えっと」「うーん、あー」「えっ」「あ」
+    False: 「うん」「ええ」「はい」「いや」「そう」（有意义的应答）
         「あー、今日は天気がいいですね」    → False
         「はい」（有意义的应答）             → False
         「そう」（有意义的应答）             → False
     """
+    text_stripped = text.strip('、。 　')
+    # 有意义的应答词不算语气词
+    if _JP_MEANINGFUL_RESPONSES.match(text_stripped):
+        return False
     return bool(_JP_FILLER_ONLY_RE.match(text))
 
 
@@ -899,6 +956,11 @@ def strip_filler_words(text: str) -> str:
         「今日は天気がいいですね、あー」  →「今日は天気がいいですね」
         「えっと、あの、やっぱりいいです」→「やっぱりいいです」
     """
+    # 先检查整段是否为有意义的应答词（不要误剥）
+    text_stripped = text.strip('、。 　')
+    if _JP_MEANINGFUL_RESPONSES.match(text_stripped):
+        return text_stripped
+
     # 去段首语气词
     text = _JP_FILLER_PREFIX_RE.sub('', text)
     # 去段尾语气词
