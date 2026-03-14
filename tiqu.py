@@ -142,6 +142,10 @@ class Config:
     vad_min_speech_ms: int = 200        # VAD 最短语音段 (ms)（250→200 捕捉短句）
     vad_min_silence_ms: int = 80        # VAD 最短静音段 (ms)（100→80 减少语音碎片化）
 
+    # --- 用户自定义替换词典（ASR 纠错） ---
+    corrections: dict = field(default_factory=dict)  # {"误识别": "正确写法", ...}
+    corrections_file: Optional[str] = None           # YAML 文件路径（自动加载）
+
     # --- 输出 ---
     output_formats: list = field(default_factory=lambda: ["vtt"])
     keep_temp: bool = False
@@ -1128,6 +1132,20 @@ def postprocess(segments: list[Segment], config: Config) -> list[Segment]:
     if echo_dedup_count:
         logger.info(f"   🔁 回声去重: {echo_dedup_count} 段")
 
+    # 5.8 用户自定义替换词典（ASR 纠错）
+    if config.corrections:
+        corrections_applied = 0
+        for seg in result:
+            original = seg.text
+            for wrong, correct in config.corrections.items():
+                if wrong in seg.text:
+                    seg.text = seg.text.replace(wrong, correct)
+            if seg.text != original:
+                corrections_applied += 1
+                logger.info(f"   📝 纠错: 「{original}」→「{seg.text}」")
+        if corrections_applied:
+            logger.info(f"   📝 ASR 纠错: {corrections_applied} 段被修正")
+
     # 6. 去除段首段尾语气词（えっと、あのー 等）
     if config.strip_fillers:
         filler_stripped = 0
@@ -1918,6 +1936,12 @@ def parse_args():
         help="禁用遗漏区域二次转录",
     )
 
+    # --- ASR 纠错词典 ---
+    parser.add_argument(
+        "--corrections",
+        help="ASR 纠错词典 YAML 文件（自动替换误识别的词汇，如角色名）",
+    )
+
     # --- 缓存 / 断点续传 ---
     parser.add_argument(
         "--cache-dir",
@@ -2004,7 +2028,57 @@ def _build_config(args) -> Config:
     if args.keep_temp is not None:
         config.keep_temp = args.keep_temp
 
+    # 4. 加载 ASR 纠错词典
+    corrections_file = getattr(args, 'corrections', None)
+    if corrections_file:
+        config.corrections_file = corrections_file
+    if config.corrections_file:
+        _load_corrections(config)
+
     return config
+
+
+def _load_corrections(config: Config):
+    """从 YAML 文件加载 ASR 纠错词典"""
+    path = config.corrections_file
+    if not path or not os.path.isfile(path):
+        if path:
+            logger.warning(f"⚠️  纠错词典文件不存在: {path}")
+        return
+
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+
+        # 支持两种格式：
+        # 格式1（推荐）: corrections: {错: 对, ...}
+        # 格式2（简洁）: 直接 {错: 对, ...}
+        if isinstance(data, dict):
+            if "corrections" in data and isinstance(data["corrections"], dict):
+                corrections = data["corrections"]
+            else:
+                corrections = {k: v for k, v in data.items()
+                               if isinstance(k, str) and isinstance(v, str)}
+        else:
+            logger.warning(f"⚠️  纠错词典格式错误: {path}")
+            return
+
+        # 合并（CLI/Config 中已有的优先）
+        for wrong, correct in corrections.items():
+            if wrong not in config.corrections:
+                config.corrections[wrong] = correct
+
+        logger.info(f"📝 已加载 {len(config.corrections)} 条 ASR 纠错规则 ← {path}")
+        for wrong, correct in list(config.corrections.items())[:10]:
+            logger.info(f"   {wrong} → {correct}")
+        if len(config.corrections) > 10:
+            logger.info(f"   ... 共 {len(config.corrections)} 条")
+
+    except ImportError:
+        logger.warning("⚠️  需要 pyyaml 才能加载纠错词典: pip install pyyaml")
+    except Exception as e:
+        logger.warning(f"⚠️  加载纠错词典失败: {e}")
 
 
 def _print_system_info(config: Config):
