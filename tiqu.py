@@ -216,6 +216,66 @@ def detect_devices() -> tuple[str, str]:
         return "cpu", "cpu"
 
 
+def wait_for_vram(min_free_gb: float = 8.0, timeout: int = 600, interval: int = 15):
+    """等待 GPU 显存释放到足够水平
+
+    Args:
+        min_free_gb: 最低可用显存（GB），默认 8GB（Demucs + Whisper 最低需求）
+        timeout: 最长等待时间（秒），默认 600s（10 分钟）
+        interval: 检查间隔（秒），默认 15s
+    """
+    import torch
+    if not torch.cuda.is_available():
+        return  # 非 CUDA 直接跳过
+
+    try:
+        free, total = torch.cuda.mem_get_info(0)
+    except Exception:
+        return  # 获取失败，不阻塞
+
+    free_gb = free / (1024 ** 3)
+    total_gb = total / (1024 ** 3)
+
+    if free_gb >= min_free_gb:
+        logger.info(f"✅ 显存检查通过: 可用 {free_gb:.1f}GB / {total_gb:.1f}GB（需要 ≥{min_free_gb:.0f}GB）")
+        return
+
+    # 显存不足，进入等待
+    logger.warning(f"⏳ 显存不足: 可用 {free_gb:.1f}GB / {total_gb:.1f}GB（需要 ≥{min_free_gb:.0f}GB）")
+    logger.warning(f"   其他进程正在占用 GPU，等待释放（最多 {timeout // 60} 分钟）...")
+    logger.warning(f"   提示: 运行 nvidia-smi 查看占用进程")
+
+    waited = 0
+    while waited < timeout:
+        time.sleep(interval)
+        waited += interval
+
+        try:
+            free, total = torch.cuda.mem_get_info(0)
+        except Exception:
+            continue
+
+        free_gb = free / (1024 ** 3)
+        remaining = timeout - waited
+
+        if free_gb >= min_free_gb:
+            logger.info(f"✅ 显存已释放: 可用 {free_gb:.1f}GB（等待了 {waited}s）")
+            return
+
+        logger.info(f"   ⏳ 仍在等待... 可用 {free_gb:.1f}GB（还需 ≥{min_free_gb:.0f}GB，剩余 {remaining}s）")
+
+    # 超时
+    try:
+        free, _ = torch.cuda.mem_get_info(0)
+        free_gb = free / (1024 ** 3)
+    except Exception:
+        free_gb = 0
+
+    logger.error(f"🔴 等待超时（{timeout // 60} 分钟）！显存仍不足: {free_gb:.1f}GB < {min_free_gb:.0f}GB")
+    logger.error(f"   请手动释放 GPU 后重试: nvidia-smi")
+    sys.exit(1)
+
+
 def run_ffmpeg(args: list[str], desc: str = "") -> subprocess.CompletedProcess:
     """执行 ffmpeg 命令"""
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"] + args
@@ -1852,6 +1912,9 @@ def process_video(video_path: str, config: Config, output_dir: Optional[str] = N
 
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"文件不存在: {video_path}")
+
+    # ★ 启动前检查 GPU 显存，不够就等，超时自动停止
+    wait_for_vram(min_free_gb=8.0, timeout=600)
 
     # 输出目录
     if output_dir is None:
