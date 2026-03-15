@@ -33,7 +33,7 @@ initial_prompt: "ああ、そうなんですか。へえ、それはすごいで
 
 # --- Demucs 人声分离 ---
 demucs_shifts: 2
-demucs_segment: null
+demucs_segment: 60
 demucs_overlap: 0.25
 
 # --- Silero VAD（只补不删模式） ---
