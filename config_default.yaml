@@ -17,7 +17,7 @@ fp16: true
 kotoba_model: "kotoba-tech/kotoba-whisper-v2.2"  # kotoba-whisper 专用
 
 # --- Whisper 转录参数 ---
-beam_size: 10
+beam_size: 5
 condition_on_previous_text: false # ★ 防止错误传播跳段
 word_timestamps: true
 no_speech_threshold: 0.6
@@ -44,7 +44,7 @@ vad_min_silence_ms: 100
 
 # --- 遗漏区域二次转录 ---
 retranscribe_missed: true
-retranscribe_beam_size: 8
+retranscribe_beam_size: 4
 retranscribe_min_duration: 0.5
 
 # --- 后处理 ---
