@@ -863,13 +863,12 @@ def _kotoba_transcribe(audio_path: str, config: Config) -> list:
     # beam search
     if config.beam_size and config.beam_size > 1:
         generate_kwargs["num_beams"] = config.beam_size
-    # Whisper 参数透传
+    # Whisper 参数透传（仅 transformers generate() 支持的参数）
+    # ★ 注意：condition_on_previous_text 等 faster-whisper 专用参数不能传给 transformers
     if config.no_speech_threshold:
         generate_kwargs["no_speech_threshold"] = config.no_speech_threshold
     if config.compression_ratio_threshold:
         generate_kwargs["compression_ratio_threshold"] = config.compression_ratio_threshold
-    if config.condition_on_previous_text is not None:
-        generate_kwargs["condition_on_previous_text"] = config.condition_on_previous_text
 
     logger.info("   转录中 (kotoba-whisper)...")
     result = pipe(
