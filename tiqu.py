@@ -863,12 +863,9 @@ def _kotoba_transcribe(audio_path: str, config: Config) -> list:
     # beam search
     if config.beam_size and config.beam_size > 1:
         generate_kwargs["num_beams"] = config.beam_size
-    # Whisper 参数透传（仅 transformers generate() 支持的参数）
-    # ★ 注意：condition_on_previous_text 等 faster-whisper 专用参数不能传给 transformers
-    if config.no_speech_threshold:
-        generate_kwargs["no_speech_threshold"] = config.no_speech_threshold
-    if config.compression_ratio_threshold:
-        generate_kwargs["compression_ratio_threshold"] = config.compression_ratio_threshold
+    # ★ 注意：transformers Whisper 的 _need_fallback 存在 bug，
+    #   传 no_speech_threshold / compression_ratio_threshold / logprob_threshold
+    #   会触发 UnboundLocalError: 'logprobs'。这些参数不传，由后处理质量检查代替。
 
     logger.info("   转录中 (kotoba-whisper)...")
     result = pipe(
