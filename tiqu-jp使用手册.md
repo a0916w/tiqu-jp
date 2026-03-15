@@ -22,9 +22,9 @@ chmod +x setup.sh
 | 1 | 安装 ffmpeg |
 | 2 | 检查 Python 环境 |
 | 3 | 安装 PyTorch + CUDA 12.4 |
-| 4 | 安装 Python 依赖（stable-ts / faster-whisper / demucs / tqdm / pyyaml） |
+| 4 | 安装 Python 依赖（stable-ts / faster-whisper / transformers / demucs / tqdm / pyyaml） |
 | 5 | 预下载 Silero VAD 模型 |
-| 6 | 验证 faster-whisper 后端 |
+| 6 | 验证各后端 |
 
 ### 1.2 手动部署
 
@@ -41,51 +41,89 @@ apt-get install -y ffmpeg
 
 ---
 
-## 二、基本用法
+## 二、三个转录后端
 
-### 2.1 单文件
+| 后端 | 命令 | 说明 | 推荐场景 |
+|------|------|------|----------|
+| **faster-whisper** | `--backend faster-whisper` | CTranslate2 加速，速度快，显存省 | **默认**，通用场景 |
+| **kotoba-whisper** | `--backend kotoba-whisper` | 日本語特化蒸馏模型（kotoba-tech） | 日语精度优先 |
+| **whisper** | `--backend whisper` | OpenAI 原版 Whisper | 兼容 / 对比测试 |
+
+### 2.1 faster-whisper（默认）
+
+```bash
+python3 tiqu.py video.mp4
+# 等价于
+python3 tiqu.py video.mp4 --backend faster-whisper --model large-v3
+```
+
+- 基于 CTranslate2，速度 2~4 倍，显存减半
+- 通过 stable-ts 封装，支持精确时间戳 + refine 微调
+- 支持 `--compute-type float16 / int8_float16 / int8`
+
+### 2.2 kotoba-whisper（日語特化）
+
+```bash
+python3 tiqu.py video.mp4 --backend kotoba-whisper
+```
+
+- 模型：`kotoba-tech/kotoba-whisper-v2.2`（HuggingFace，首次自动下载）
+- 基于 distil-whisper 架构，专门针对日语微调
+- 通过 transformers pipeline 调用，支持 GPU fp16
+- 可指定其他模型：`--kotoba-model kotoba-tech/kotoba-whisper-v2.0`
+
+### 2.3 whisper（原版）
+
+```bash
+python3 tiqu.py video.mp4 --backend whisper
+```
+
+- OpenAI 原版 Whisper，通过 stable-ts 封装
+- 支持 fp16 加速（CUDA），refine 时间戳微调
+
+---
+
+## 三、基本用法
+
+### 3.1 单文件
 
 ```bash
 python3 tiqu.py video.mp4
 ```
 
-默认使用 `faster-whisper` + `large-v3` 模型，输出 `.vtt` 字幕文件到视频同目录。
-
-### 2.2 批量处理
+### 3.2 批量处理
 
 ```bash
 python3 tiqu.py *.mp4 --output-dir ./subs
 ```
 
-### 2.3 指定输出格式
+### 3.3 指定输出格式
 
 ```bash
 python3 tiqu.py video.mp4 --format vtt srt json
 ```
 
-### 2.4 使用配置文件
+### 3.4 使用配置文件
 
 ```bash
 python3 tiqu.py video.mp4 --config config_default.yaml
 ```
 
-### 2.5 使用纠错词典
+### 3.5 使用纠错词典
 
 ```bash
 python3 tiqu.py video.mp4 --corrections corrections.yaml
 ```
 
-### 2.6 启用断点续传
+### 3.6 启用断点续传
 
 ```bash
 python3 tiqu.py video.mp4 --cache-dir ./cache
 ```
 
-处理过的步骤会被缓存，中断后重新运行会跳过已完成的步骤。
-
 ---
 
-## 三、处理流程
+## 四、处理流程
 
 ```
 视频文件
@@ -103,7 +141,7 @@ python3 tiqu.py video.mp4 --cache-dir ./cache
 ③.5 Silero VAD 语音活动检测（独立标注哪里有人说话）
   │
   ▼
-④ faster-whisper 转录（large-v3, beam_size=10, fp16）
+④ ASR 转录（faster-whisper / kotoba-whisper / whisper 三选一）
   │
   ▼
 ⑤ 质量检查（幻觉检测 / 重复过滤 / 日文验证 / 语气词过滤）
@@ -120,7 +158,7 @@ VTT / SRT / JSON
 
 ---
 
-## 四、CLI 参数速查
+## 五、CLI 参数速查
 
 ### 输出
 
@@ -133,8 +171,9 @@ VTT / SRT / JSON
 
 | 参数 | 说明 | 默认 |
 |------|------|------|
-| `--backend` | `faster-whisper`（推荐）/ `whisper` | `faster-whisper` |
+| `--backend` | `faster-whisper` / `kotoba-whisper` / `whisper` | `faster-whisper` |
 | `--compute-type` | `float16` / `int8_float16` / `int8` / `float32` | `float16` |
+| `--kotoba-model` | kotoba-whisper HuggingFace 模型 ID | `kotoba-tech/kotoba-whisper-v2.2` |
 | `--model` / `-m` | Whisper 模型大小 | `large-v3` |
 | `--device` | `auto` / `cuda` / `mps` / `cpu` | `auto` |
 | `--beam-size` | Beam search 宽度 | `10` |
@@ -172,7 +211,7 @@ VTT / SRT / JSON
 
 ---
 
-## 五、配置文件 (YAML)
+## 六、配置文件 (YAML)
 
 默认配置文件 `config_default.yaml`：
 
@@ -180,9 +219,10 @@ VTT / SRT / JSON
 # --- 基础设置 ---
 language: "ja"
 model_name: "large-v3"
-backend: "faster-whisper"
-compute_type: "float16"
+backend: "faster-whisper"           # faster-whisper | kotoba-whisper | whisper
+compute_type: "float16"             # faster-whisper 专用
 fp16: true
+kotoba_model: "kotoba-tech/kotoba-whisper-v2.2"  # kotoba-whisper 专用
 
 # --- Whisper 转录参数 ---
 beam_size: 10
@@ -230,7 +270,7 @@ output_formats:
 
 ---
 
-## 六、ASR 纠错词典
+## 七、ASR 纠错词典
 
 文件格式（YAML）：
 
@@ -260,9 +300,9 @@ python3 tiqu.py video.mp4 --corrections corrections.yaml
 
 ---
 
-## 七、常用场景
+## 八、常用场景
 
-### 7.1 最高质量（推荐）
+### 8.1 最高质量 — faster-whisper（推荐）
 
 ```bash
 python3 tiqu.py video.mp4 \
@@ -273,7 +313,27 @@ python3 tiqu.py video.mp4 \
   --verbose
 ```
 
-### 7.2 快速出稿（牺牲一点精度换速度）
+### 8.2 日語特化 — kotoba-whisper
+
+```bash
+python3 tiqu.py video.mp4 \
+  --backend kotoba-whisper \
+  --corrections corrections.yaml \
+  --format vtt srt \
+  --verbose
+```
+
+### 8.3 对比三个后端
+
+```bash
+# 先跑三次（用缓存复用前面的步骤）
+python3 tiqu.py video.mp4 --backend faster-whisper --cache-dir ./cache -o ./out-fw
+python3 tiqu.py video.mp4 --backend kotoba-whisper --cache-dir ./cache -o ./out-kotoba
+python3 tiqu.py video.mp4 --backend whisper        --cache-dir ./cache -o ./out-whisper
+# 然后比较三份字幕的覆盖率报告和实际效果
+```
+
+### 8.4 快速出稿（牺牲一点精度换速度）
 
 ```bash
 python3 tiqu.py video.mp4 \
@@ -283,13 +343,13 @@ python3 tiqu.py video.mp4 \
   --no-refine
 ```
 
-### 7.3 源音频很干净（无 BGM）
+### 8.5 源音频很干净（无 BGM）
 
 ```bash
 python3 tiqu.py video.mp4 --skip-demucs
 ```
 
-### 7.4 调试模式
+### 8.6 调试模式
 
 ```bash
 python3 tiqu.py video.mp4 --keep-temp --verbose
@@ -297,7 +357,7 @@ python3 tiqu.py video.mp4 --keep-temp --verbose
 # 可逐一检查每步的音频质量
 ```
 
-### 7.5 显存不足（< 8GB VRAM）
+### 8.7 显存不足（< 8GB VRAM）
 
 ```bash
 python3 tiqu.py video.mp4 \
@@ -308,7 +368,7 @@ python3 tiqu.py video.mp4 \
 
 ---
 
-## 八、输出说明
+## 九、输出说明
 
 ### 覆盖率报告
 
@@ -355,7 +415,7 @@ python3 tiqu.py video.mp4 \
 
 ---
 
-## 九、依赖清单
+## 十、依赖清单
 
 | 包 | 用途 | 版本 |
 |----|------|------|
@@ -363,6 +423,7 @@ python3 tiqu.py video.mp4 \
 | stable-ts | Whisper 精确时间戳 | ≥ 2.16 |
 | faster-whisper | CTranslate2 加速转录 | ≥ 1.0 |
 | openai-whisper | Whisper 原版（备用后端） | ≥ 20231117 |
+| transformers + accelerate | kotoba-whisper 后端 | ≥ 4.39 |
 | demucs | 人声分离 | ≥ 4.0.1 |
 | tqdm | 进度条 | ≥ 4.60 |
 | pyyaml | YAML 配置支持 | ≥ 6.0 |
@@ -371,7 +432,7 @@ python3 tiqu.py video.mp4 \
 
 ---
 
-## 十、文件结构
+## 十一、文件结构
 
 ```
 tiqu-jp/
@@ -380,5 +441,6 @@ tiqu-jp/
 ├── corrections_example.yaml # 纠错词典示例
 ├── requirements.txt         # Python 依赖
 ├── setup.sh                 # 一键部署脚本
+├── tiqu-jp使用手册.md        # 本文档
 └── .gitignore
 ```

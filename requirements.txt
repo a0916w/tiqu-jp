@@ -28,6 +28,11 @@ faster-whisper>=1.0.0
 # OpenAI Whisper (stable-ts 依赖; 使用 faster-whisper 后端时仅用于分词器)
 openai-whisper>=20231117
 
+# transformers + accelerate: kotoba-whisper 后端（日本語特化蒸馏模型）
+# 仅 --backend kotoba-whisper 时需要，其他后端不依赖
+transformers>=4.39.0
+accelerate>=0.26.0
+
 # ─── 人声分离 ────────────────────────────────────────────────
 
 demucs>=4.0.1

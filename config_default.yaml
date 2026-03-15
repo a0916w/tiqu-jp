@@ -11,9 +11,10 @@
 # --- 基础设置 ---
 language: "ja"
 model_name: "large-v3"
-backend: "faster-whisper"
-compute_type: "float16"
+backend: "faster-whisper"           # faster-whisper | kotoba-whisper | whisper
+compute_type: "float16"             # faster-whisper 专用
 fp16: true
+kotoba_model: "kotoba-tech/kotoba-whisper-v2.2"  # kotoba-whisper 专用
 
 # --- Whisper 转录参数 ---
 beam_size: 10

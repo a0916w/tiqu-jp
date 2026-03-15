@@ -5,6 +5,7 @@ tiqu.py — 日本語字幕提取工具
 
 后端支持:
   - faster-whisper (默认) — CTranslate2 加速，速度 2~4 倍，显存减半
+  - kotoba-whisper        — 日本語特化蒸馏模型（kotoba-tech），精度更高
   - whisper (原版)        — OpenAI 原版 Whisper
 
 特性:
@@ -30,7 +31,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 # ─── 可选依赖（软导入，缺失时自动降级） ──────────────────────────
 try:
@@ -55,8 +56,9 @@ class Config:
     """全局配置参数"""
 
     # --- 转录后端 ---
-    backend: str = "faster-whisper"   # "faster-whisper" (推荐) | "whisper" (原版)
+    backend: str = "faster-whisper"   # "faster-whisper" (推荐) | "kotoba-whisper" (日语特化) | "whisper" (原版)
     compute_type: str = "float16"     # faster-whisper 精度: float16 / int8_float16 / int8 / float32
+    kotoba_model: str = "kotoba-tech/kotoba-whisper-v2.2"  # kotoba-whisper HuggingFace 模型 ID
 
     # --- Whisper / stable-ts ---
     model: str = "large-v3"
@@ -737,13 +739,16 @@ def print_coverage_report(segments: list, speech_regions: list[tuple[float, floa
 _whisper_model = None
 _whisper_model_key = None
 _whisper_backend = None    # 实际使用的后端（可能因加载失败而回退）
+_kotoba_pipe = None        # kotoba-whisper 的 transformers pipeline 缓存
+_kotoba_pipe_key = None
 
 
 def _get_whisper_model(config: Config):
     """获取或缓存 Whisper 模型（批量处理只加载一次）
 
-    支持两种后端：
+    支持三种后端：
     - faster-whisper: CTranslate2 加速，速度 2~4×，显存减半
+    - kotoba-whisper: 日本語特化蒸馏模型（HuggingFace transformers）
     - whisper: OpenAI 原版 Whisper
     """
     global _whisper_model, _whisper_model_key, _whisper_backend
@@ -777,6 +782,15 @@ def _get_whisper_model(config: Config):
             logger.warning(f"   自动回退到原版 Whisper...")
             # 继续走 whisper 分支
 
+    elif config.backend == "kotoba-whisper":
+        # ★ kotoba-whisper 后端：返回 None 占位符
+        #   实际模型通过 _get_kotoba_pipeline() 延迟加载
+        _whisper_backend = "kotoba-whisper"
+        _whisper_model_key = model_key
+        _whisper_model = None  # kotoba 不使用 stable-ts 模型
+        logger.info(f"   ✅ 已选择 kotoba-whisper 后端（延迟加载）")
+        return _whisper_model
+
     # 原版 Whisper 后端
     logger.info(f"   加载 Whisper {config.model}...")
     _whisper_model = stable_whisper.load_model(config.model, device=config.device)
@@ -785,23 +799,148 @@ def _get_whisper_model(config: Config):
     return _whisper_model
 
 
+def _get_kotoba_pipeline(config: Config):
+    """获取/缓存 kotoba-whisper 的 transformers pipeline
+
+    kotoba-whisper (kotoba-tech/kotoba-whisper-v2.2) 是日本語特化蒸馏模型，
+    基于 distil-whisper 架构，通过 HuggingFace transformers pipeline 调用。
+    """
+    global _kotoba_pipe, _kotoba_pipe_key
+
+    pipe_key = f"{config.kotoba_model}:{config.device}"
+    if _kotoba_pipe is not None and _kotoba_pipe_key == pipe_key:
+        return _kotoba_pipe
+
+    import torch
+    try:
+        from transformers import pipeline as hf_pipeline
+    except ImportError:
+        raise ImportError(
+            "kotoba-whisper 后端需要 transformers 库。\n"
+            "请安装: pip install transformers accelerate\n"
+            "或使用其他后端: --backend faster-whisper"
+        )
+
+    # 确定设备和 dtype
+    if config.device == "cuda" and torch.cuda.is_available():
+        device_id = 0
+        torch_dtype = torch.float16
+    else:
+        device_id = -1  # CPU
+        torch_dtype = torch.float32
+
+    model_id = config.kotoba_model
+    logger.info(f"   加载 kotoba-whisper: {model_id} ...")
+
+    _kotoba_pipe = hf_pipeline(
+        "automatic-speech-recognition",
+        model=model_id,
+        torch_dtype=torch_dtype,
+        device=device_id if device_id >= 0 else "cpu",
+        # chunk_length_s 控制长音频分块，30s 是 Whisper 标准窗口
+        chunk_length_s=30,
+        batch_size=8 if device_id >= 0 else 1,
+    )
+    _kotoba_pipe_key = pipe_key
+    logger.info(f"   ✅ kotoba-whisper 模型已加载")
+    return _kotoba_pipe
+
+
+def _kotoba_transcribe(audio_path: str, config: Config) -> list:
+    """使用 kotoba-whisper pipeline 转录并返回 Segment 列表
+
+    kotoba-whisper 通过 transformers pipeline 输出 chunks：
+    [{"text": "...", "timestamp": (start, end)}, ...]
+
+    将其转换为 Segment 列表，与 extract_segments() 输出格式统一。
+    """
+    pipe = _get_kotoba_pipeline(config)
+
+    generate_kwargs = {
+        "language": "ja",
+        "task": "transcribe",
+    }
+    # beam search
+    if config.beam_size and config.beam_size > 1:
+        generate_kwargs["num_beams"] = config.beam_size
+    # Whisper 参数透传
+    if config.no_speech_threshold:
+        generate_kwargs["no_speech_threshold"] = config.no_speech_threshold
+    if config.compression_ratio_threshold:
+        generate_kwargs["compression_ratio_threshold"] = config.compression_ratio_threshold
+    if config.condition_on_previous_text is not None:
+        generate_kwargs["condition_on_previous_text"] = config.condition_on_previous_text
+
+    logger.info("   转录中 (kotoba-whisper)...")
+    result = pipe(
+        audio_path,
+        return_timestamps=True,
+        generate_kwargs=generate_kwargs,
+    )
+
+    # result 格式: {"text": "全文", "chunks": [{"text": "...", "timestamp": (start, end)}, ...]}
+    segments = []
+    chunks = result.get("chunks", [])
+
+    for chunk in chunks:
+        text = chunk.get("text", "").strip()
+        if not text:
+            continue
+
+        ts = chunk.get("timestamp", (None, None))
+        start = ts[0] if ts[0] is not None else 0.0
+        end = ts[1] if ts[1] is not None else start + 0.5
+
+        segments.append(Segment(
+            start=round(start, 3),
+            end=round(end, 3),
+            text=text,
+            confidence=0.0,       # transformers pipeline 不提供这些指标
+            no_speech_prob=0.0,
+            compression_ratio=1.0,
+        ))
+
+    logger.info(f"   kotoba-whisper 识别出 {len(segments)} 段")
+    return segments
+
+
 def transcribe_audio(audio_path: str, config: Config):
-    """使用 stable-ts (Whisper / faster-whisper) 进行日语转录"""
+    """使用 stable-ts (Whisper / faster-whisper) 或 kotoba-whisper 进行日语转录
+
+    返回:
+      - stable-ts 后端: stable-ts Result 对象（含 .segments）
+      - kotoba-whisper: list[Segment]（直接返回段列表）
+    """
     # 确定精度标签
-    if _whisper_backend == "faster-whisper" or config.backend == "faster-whisper":
+    actual_backend = _whisper_backend or config.backend
+    if actual_backend == "faster-whisper":
         fp_label = f"compute_type={config.compute_type}"
+    elif actual_backend == "kotoba-whisper":
+        fp_label = "transformers"
     else:
         use_fp16 = config.fp16 and config.device == "cuda"
         fp_label = "fp16" if use_fp16 else "fp32"
 
-    logger.info(f"📝 Step 4 — 转录 (后端: {config.backend}, 模型: {config.model}, "
+    model_label = config.kotoba_model if actual_backend == "kotoba-whisper" else config.model
+    logger.info(f"📝 Step 4 — 转录 (后端: {actual_backend}, 模型: {model_label}, "
                 f"设备: {config.device}, {fp_label})...")
 
     with timed_step("转录"):
         model = _get_whisper_model(config)
         actual_backend = _whisper_backend or config.backend
 
-        if actual_backend == "faster-whisper":
+        if actual_backend == "kotoba-whisper":
+            # ═══ kotoba-whisper 路径（transformers pipeline）═══
+            # 直接返回 Segment 列表（不经过 stable-ts）
+            segments = _kotoba_transcribe(audio_path, config)
+            # CUDA: 显示峰值显存
+            if config.device == "cuda":
+                import torch
+                peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                logger.info(f"   转录峰值显存: {peak_mb:.0f}MB")
+            return segments  # ★ 注意：kotoba 直接返回 list[Segment]
+
+        elif actual_backend == "faster-whisper":
             # ═══ faster-whisper 路径 ═══
             transcribe_kwargs = dict(
                 audio=audio_path,
@@ -1546,31 +1685,64 @@ def retranscribe_missed_regions(
                 vad_threshold=config.vad_onset,
             )
 
-            if actual_backend == "faster-whisper":
+            if actual_backend == "kotoba-whisper":
+                # kotoba-whisper: 用 pipeline 转录片段
+                clip_segs = _kotoba_transcribe(clip_path, config)
+                for seg in clip_segs:
+                    text = seg.text.strip()
+                    if not text:
+                        continue
+                    if not is_japanese_text(text):
+                        continue
+                    if config.strip_fillers and is_filler_only(text):
+                        continue
+                    new_segments.append(Segment(
+                        start=round(seg.start + padded_start, 3),
+                        end=round(seg.end + padded_start, 3),
+                        text=text,
+                        confidence=seg.confidence,
+                        no_speech_prob=seg.no_speech_prob,
+                        compression_ratio=seg.compression_ratio,
+                    ))
+            elif actual_backend == "faster-whisper":
                 result = model.transcribe_stable(clip_path, **retranscribe_kwargs)
+                # 提取有效段并调整时间戳
+                for seg in result.segments:
+                    text = seg.text.strip()
+                    if not text:
+                        continue
+                    if not is_japanese_text(text):
+                        continue
+                    if config.strip_fillers and is_filler_only(text):
+                        continue
+                    new_segments.append(Segment(
+                        start=round(seg.start + padded_start, 3),
+                        end=round(seg.end + padded_start, 3),
+                        text=text,
+                        confidence=getattr(seg, "avg_logprob", 0.0),
+                        no_speech_prob=getattr(seg, "no_speech_prob", 0.0),
+                        compression_ratio=getattr(seg, "compression_ratio", 1.0),
+                    ))
             else:
                 use_fp16 = config.fp16 and config.device == "cuda"
                 retranscribe_kwargs["fp16"] = use_fp16
                 result = model.transcribe(clip_path, **retranscribe_kwargs)
-
-            # 提取有效段并调整时间戳
-            for seg in result.segments:
-                text = seg.text.strip()
-                if not text:
-                    continue
-                if not is_japanese_text(text):
-                    continue
-                if config.strip_fillers and is_filler_only(text):
-                    continue
-
-                new_segments.append(Segment(
-                    start=round(seg.start + padded_start, 3),
-                    end=round(seg.end + padded_start, 3),
-                    text=text,
-                    confidence=getattr(seg, "avg_logprob", 0.0),
-                    no_speech_prob=getattr(seg, "no_speech_prob", 0.0),
-                    compression_ratio=getattr(seg, "compression_ratio", 1.0),
-                ))
+                for seg in result.segments:
+                    text = seg.text.strip()
+                    if not text:
+                        continue
+                    if not is_japanese_text(text):
+                        continue
+                    if config.strip_fillers and is_filler_only(text):
+                        continue
+                    new_segments.append(Segment(
+                        start=round(seg.start + padded_start, 3),
+                        end=round(seg.end + padded_start, 3),
+                        text=text,
+                        confidence=getattr(seg, "avg_logprob", 0.0),
+                        no_speech_prob=getattr(seg, "no_speech_prob", 0.0),
+                        compression_ratio=getattr(seg, "compression_ratio", 1.0),
+                    ))
 
         except Exception as e:
             logger.debug(f"   区域 {padded_start:.1f}-{padded_end:.1f}s 二次转录失败: {e}")
@@ -1819,7 +1991,11 @@ def process_video(video_path: str, config: Config, output_dir: Optional[str] = N
             logger.info(f"   加载了 {len(segments)} 段字幕")
         else:
             result = transcribe_audio(enhanced_audio, config)
-            segments = extract_segments(result)
+            # kotoba-whisper 直接返回 list[Segment]，其他后端返回 stable-ts Result
+            if isinstance(result, list):
+                segments = result
+            else:
+                segments = extract_segments(result)
             # 保存到缓存
             if use_cache:
                 _save_segments_cache(segments, segments_cache_path)
@@ -1942,7 +2118,8 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python tiqu.py video.mp4                                  # 基本用法
+  python tiqu.py video.mp4                                  # 基本用法 (faster-whisper)
+  python tiqu.py video.mp4 --backend kotoba-whisper         # 日本語特化模型
   python tiqu.py video.mp4 --backend whisper                # 使用原版 Whisper
   python tiqu.py video.mp4 --compute-type int8_float16      # INT8 量化加速
   python tiqu.py video.mp4 --format vtt srt --verbose       # 多格式 + 详细日志
@@ -1976,13 +2153,18 @@ def parse_args():
     # --- 后端 ---
     parser.add_argument(
         "--backend",
-        choices=["faster-whisper", "whisper"],
+        choices=["faster-whisper", "kotoba-whisper", "whisper"],
         help="转录后端 (默认: faster-whisper)",
     )
     parser.add_argument(
         "--compute-type",
         choices=["float16", "int8_float16", "int8", "float32"],
         help="faster-whisper 计算精度 (默认: float16)",
+    )
+    parser.add_argument(
+        "--kotoba-model",
+        default=None,
+        help="kotoba-whisper HuggingFace 模型 ID (默认: kotoba-tech/kotoba-whisper-v2.2)",
     )
 
     # --- 模型 ---
@@ -2118,6 +2300,8 @@ def _build_config(args) -> Config:
         config.backend = args.backend
     if args.compute_type is not None:
         config.compute_type = args.compute_type
+    if getattr(args, 'kotoba_model', None) is not None:
+        config.kotoba_model = args.kotoba_model
     if args.model is not None:
         config.model = args.model
     if args.device is not None:
@@ -2219,9 +2403,14 @@ def _print_system_info(config: Config):
         _vram = getattr(props, 'total_memory', getattr(props, 'total_mem', 0))
         logger.info(f"   VRAM: {_vram / (1024**3):.1f}GB")
         logger.info(f"   CUDA: {torch.version.cuda}")
-    logger.info(f"   后端: {config.backend} | 模型: {config.model}")
+    if config.backend == "kotoba-whisper":
+        logger.info(f"   后端: {config.backend} | 模型: {config.kotoba_model}")
+    else:
+        logger.info(f"   后端: {config.backend} | 模型: {config.model}")
     if config.backend == "faster-whisper":
         logger.info(f"   compute_type: {config.compute_type}")
+    elif config.backend == "kotoba-whisper":
+        logger.info(f"   推理: transformers pipeline (HuggingFace)")
     else:
         logger.info(f"   fp16: {config.fp16 and config.device == 'cuda'}")
     logger.info(f"   Whisper 设备: {config.device}")

@@ -143,6 +143,12 @@ except ImportError:
     print(f'   faster-whisper:   ❌ 未安装')
 
 try:
+    import transformers
+    print(f'   transformers:     {transformers.__version__} (kotoba-whisper)')
+except ImportError:
+    print(f'   transformers:     ❌ (kotoba-whisper 需要)')
+
+try:
     import demucs
     print(f'   demucs:           ✅')
 except ImportError:
@@ -170,6 +176,7 @@ except:
 print()
 print('🎬 使用方法:')
 print('   python3 tiqu.py video.mp4                              # 默认 (faster-whisper)')
+print('   python3 tiqu.py video.mp4 --backend kotoba-whisper     # 日本語特化模型')
 print('   python3 tiqu.py video.mp4 --backend whisper            # 原版 Whisper')
 print('   python3 tiqu.py video.mp4 --compute-type int8_float16  # INT8 量化加速')
 print('   python3 tiqu.py video.mp4 --cache-dir ./cache          # 断点续传')
