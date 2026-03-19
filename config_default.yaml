@@ -10,14 +10,14 @@
 
 # --- 基础设置 ---
 language: "ja"
-model_name: "large-v3"
+model: "large-v3"
 backend: "faster-whisper"           # faster-whisper | kotoba-whisper | whisper
 compute_type: "float16"             # faster-whisper 专用
 fp16: true
 kotoba_model: "kotoba-tech/kotoba-whisper-v2.2"  # kotoba-whisper 专用
 
 # --- Whisper 转录参数 ---
-beam_size: 5
+beam_size: 5                            # 代码默认 10，这里用 5 是速度和精度的平衡
 condition_on_previous_text: false # ★ 防止错误传播跳段
 word_timestamps: true
 no_speech_threshold: 0.6
@@ -51,7 +51,7 @@ retranscribe_min_duration: 0.5
 min_segment_duration: 0.3
 max_segment_duration: 8.0
 min_display_duration: 0.5
-strip_filler_words: true
+strip_fillers: true
 
 # --- 输出 ---
 output_formats:

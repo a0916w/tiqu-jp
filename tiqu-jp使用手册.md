@@ -218,7 +218,7 @@ VTT / SRT / JSON
 ```yaml
 # --- 基础设置 ---
 language: "ja"
-model_name: "large-v3"
+model: "large-v3"
 backend: "faster-whisper"           # faster-whisper | kotoba-whisper | whisper
 compute_type: "float16"             # faster-whisper 专用
 fp16: true

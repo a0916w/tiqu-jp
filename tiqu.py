@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
+
+__version__ = "1.0.0"
 
 # ─── 可选依赖（软导入，缺失时自动降级） ──────────────────────────
 try:
@@ -341,6 +344,7 @@ def extract_audio(video_path: str, output_path: str, config: Config,
         run_ffmpeg([
             "-i", video_path,
             "-vn",                    # 不要视频
+            "-map", "0:a:0",          # ★ 显式选择第一条音频流（避免多音轨文件选错）
             "-acodec", "pcm_s16le",   # 16-bit PCM
             "-ar", str(sr),
             "-ac", "1",               # 单声道
@@ -443,26 +447,80 @@ def separate_vocals(audio_path: str, output_path: str, config: Config) -> str:
 # Step 3: ffmpeg 语音增强 + 降采样至 16kHz
 # ═══════════════════════════════════════════════════════════════════
 
+def _parse_loudnorm_stats(ffmpeg_stderr: str) -> dict:
+    """从 ffmpeg loudnorm print_format=json 输出中解析测量值
+
+    loudnorm 第一遍 (分析) 会在 stderr 中输出 JSON，包含:
+    input_i, input_tp, input_lra, input_thresh, target_offset 等。
+    """
+    try:
+        json_match = re.search(
+            r'\{[^{}]*"input_i"[^{}]*\}', ffmpeg_stderr, re.DOTALL
+        )
+        if not json_match:
+            return {}
+        data = json.loads(json_match.group())
+        required = ['input_i', 'input_tp', 'input_lra', 'input_thresh', 'target_offset']
+        for key in required:
+            if key not in data:
+                return {}
+        return data
+    except Exception:
+        return {}
+
+
 def enhance_audio(input_path: str, output_path: str, config: Config) -> str:
     """带通滤波 + 动态压缩 + 响度标准化 + 降采样至 16kHz
 
     Demucs 输出为 44.1kHz，这里同时做增强和降采样，一步到位给 Whisper。
+
+    ★ 使用两遍 loudnorm 避免单遍模式导致的音频时长变化:
+       - Pass 1: 分析音频响度（-f null）
+       - Pass 2: 用测量值 + linear=true 线性应用（时长完全不变）
     """
     logger.info("🔊 Step 3 — 语音增强 + 降采样至 16kHz...")
 
     with timed_step("语音增强"):
-        # 构建 ffmpeg 音频滤镜链
-        filters = [
+        # 基础滤镜（不含 loudnorm）
+        base_filters = [
             # 高通滤波 — 去除低频隆隆声
             f"highpass=f={config.highpass_freq}:poles=2",
             # 低通滤波 — 去除高频噪音（保留齿擦音）
             f"lowpass=f={config.lowpass_freq}:poles=2",
             # 动态压缩 — 缩小动态范围，让轻声更清晰
             "compand=attacks=0.3:decays=0.8:points=-80/-80|-45/-45|-27/-25|0/-10:gain=5",
-            # EBU R128 响度标准化
-            f"loudnorm=I={config.target_lufs}:TP=-1.5:LRA=11",
         ]
-        filter_chain = ",".join(filters)
+        base_chain = ",".join(base_filters)
+        loudnorm_base = f"loudnorm=I={config.target_lufs}:TP=-1.5:LRA=11"
+
+        # ── Pass 1: 分析音频响度数据（输出到 null） ──
+        logger.debug("   loudnorm Pass 1: 分析响度...")
+        analyze_result = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner",
+             "-i", input_path,
+             "-af", f"{base_chain},{loudnorm_base}:print_format=json",
+             "-f", "null", "-"],
+            capture_output=True, text=True,
+        )
+        measured = _parse_loudnorm_stats(analyze_result.stderr)
+
+        if measured:
+            # ── Pass 2: 使用测量值 + linear=true 线性标准化（时长不变！） ──
+            loudnorm_pass2 = (
+                f"loudnorm=I={config.target_lufs}:TP=-1.5:LRA=11"
+                f":measured_I={measured['input_i']}"
+                f":measured_TP={measured['input_tp']}"
+                f":measured_LRA={measured['input_lra']}"
+                f":measured_thresh={measured['input_thresh']}"
+                f":offset={measured['target_offset']}"
+                f":linear=true:print_format=summary"
+            )
+            filter_chain = f"{base_chain},{loudnorm_pass2}"
+            logger.debug("   loudnorm Pass 2: 线性标准化（时长保持不变）")
+        else:
+            # 分析失败 → 退回 linear=true 单遍模式（至少保证时长不变）
+            logger.debug("   loudnorm 分析失败，退回 linear=true 单遍模式")
+            filter_chain = f"{base_chain},{loudnorm_base}:linear=true"
 
         run_ffmpeg([
             "-i", input_path,
@@ -583,7 +641,7 @@ def compute_speech_overlap(seg_start: float, seg_end: float,
 
 
 def vad_validate(segments: list, speech_regions: list[tuple[float, float]],
-                 config: Config) -> list:
+                 config: Config) -> tuple[list, list[tuple[float, float]]]:
     """用 Silero VAD 结果交叉验证 Whisper 字幕段
 
     ★ 策略：保守删除 + 连锁检测
@@ -592,10 +650,13 @@ def vad_validate(segments: list, speech_regions: list[tuple[float, float]],
     3. 连续 2+ 段 0% 重叠 → 几乎确定是幻觉链（静音场景乱输出），直接删除
     4. 孤立的 0% 段，若 < 2s 也删除（短幻觉）
     5. 有任何 VAD 重叠的段 → 保留（即使重叠低，也可能是真实语音）
+
+    Returns:
+        (filtered_segments, missed_regions)
     """
     if not speech_regions:
         logger.info("   ⏭️ 无 VAD 数据，跳过交叉验证")
-        return segments
+        return segments, []
 
     logger.info("🔍 VAD 交叉验证字幕段（保守删除 + 连锁检测）...")
 
@@ -682,7 +743,7 @@ def vad_validate(segments: list, speech_regions: list[tuple[float, float]],
         logger.info("   ✅ 未检测到遗漏的语音区域")
 
     logger.info(f"   保留 {len(filtered)} / {len(segments)} 段")
-    return filtered
+    return filtered, missed
 
 
 def detect_missed_speech(segments: list, speech_regions: list[tuple[float, float]],
@@ -727,6 +788,70 @@ def get_audio_duration(audio_path: str) -> float:
         return 0.0
 
 
+def get_media_info(video_path: str) -> dict:
+    """使用 ffprobe 获取视频/音频流的时长和起始时间信息
+
+    用于检测和修正音视频不同步问题：
+    - 音频流起始偏移 (start_time != 0)
+    - 音视频流时长不一致（某些 MOV/MP4 录制软件的常见问题）
+
+    Returns:
+        {
+            'video_duration': float,    # 视频流时长 (秒)
+            'audio_duration': float,    # 音频流时长 (秒)
+            'audio_start_time': float,  # 音频流起始偏移 (秒)
+            'audio_sample_rate': int,   # 音频采样率
+            'format_duration': float,   # 容器总时长 (秒)
+        }
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-show_format", video_path],
+            capture_output=True, text=True,
+        )
+        data = json.loads(result.stdout)
+
+        info = {
+            'video_duration': 0.0,
+            'audio_duration': 0.0,
+            'audio_start_time': 0.0,
+            'audio_sample_rate': 0,
+            'format_duration': 0.0,
+        }
+
+        # 容器时长
+        if 'format' in data:
+            fmt_dur = data['format'].get('duration')
+            if fmt_dur and fmt_dur != 'N/A':
+                info['format_duration'] = float(fmt_dur)
+
+        # 各流信息
+        for stream in data.get('streams', []):
+            codec_type = stream.get('codec_type', '')
+
+            if codec_type == 'video' and info['video_duration'] == 0:
+                dur = stream.get('duration')
+                if dur and dur != 'N/A':
+                    info['video_duration'] = float(dur)
+
+            elif codec_type == 'audio' and info['audio_duration'] == 0:
+                dur = stream.get('duration')
+                if dur and dur != 'N/A':
+                    info['audio_duration'] = float(dur)
+                start = stream.get('start_time', '0')
+                if start and start != 'N/A':
+                    info['audio_start_time'] = float(start)
+                sr = stream.get('sample_rate', '0')
+                if sr and sr != 'N/A':
+                    info['audio_sample_rate'] = int(sr)
+
+        return info
+    except Exception as e:
+        logger.debug(f"获取媒体信息失败: {e}")
+        return {}
+
+
 def print_coverage_report(segments: list, speech_regions: list[tuple[float, float]],
                           audio_duration: float):
     """输出字幕覆盖率报告 — Precision & Recall"""
@@ -759,13 +884,27 @@ def print_coverage_report(segments: list, speech_regions: list[tuple[float, floa
         precision = subtitle_in_speech / max(total_subtitle, 0.01)
 
         # Recall: 真实语音时间中，有多少被字幕覆盖
+        # ★ 使用区间合并避免重叠字幕的双重计数
         speech_covered = 0.0
         for vad_s, vad_e in speech_regions:
+            # 收集所有字幕与该 VAD 区域的交集
+            overlaps = []
             for seg in segments:
                 o_s = max(vad_s, seg.start)
                 o_e = min(vad_e, seg.end)
                 if o_e > o_s:
-                    speech_covered += o_e - o_s
+                    overlaps.append((o_s, o_e))
+            # 合并重叠区间后计算覆盖
+            if overlaps:
+                overlaps.sort()
+                merged_s, merged_e = overlaps[0]
+                for o_s, o_e in overlaps[1:]:
+                    if o_s <= merged_e:
+                        merged_e = max(merged_e, o_e)
+                    else:
+                        speech_covered += merged_e - merged_s
+                        merged_s, merged_e = o_s, o_e
+                speech_covered += merged_e - merged_s
         recall = speech_covered / max(total_speech, 0.01)
 
         logger.info(f"   ─────────────────────────────────────")
@@ -1632,8 +1771,10 @@ def normalize_japanese_punctuation(text: str) -> str:
     # 5. 半角片假名 → 全角（ｱ→ア, ｲ→イ 等）
     text = _halfwidth_katakana_to_fullwidth(text)
 
-    # 6. 去除多余空格（日文不需要空格）
-    text = re.sub(r'[\s　]+', '', text)
+    # 6. 去除日文字符间的多余空格（保留英数之间的空格如 "iPhone 15"）
+    _CJK = r'[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff\u3400-\u4dbf\uff00-\uffef]'
+    text = re.sub(rf'(?<={_CJK})[\s　]+', '', text)  # 日文字符后的空格
+    text = re.sub(rf'[\s　]+(?={_CJK})', '', text)    # 日文字符前的空格
 
     # 7. 清理首尾多余标点
     text = text.strip('、。')
@@ -1743,7 +1884,11 @@ def retranscribe_missed_regions(
 
             if actual_backend == "kotoba-whisper":
                 # kotoba-whisper: 用 pipeline 转录片段
-                clip_segs = _kotoba_transcribe(clip_path, config)
+                # ★ 使用二次转录专用 beam_size（更宽容）
+                from copy import copy
+                retranscribe_config = copy(config)
+                retranscribe_config.beam_size = config.retranscribe_beam_size
+                clip_segs = _kotoba_transcribe(clip_path, retranscribe_config)
                 for seg in clip_segs:
                     text = seg.text.strip()
                     if not text:
@@ -1902,6 +2047,71 @@ def write_json(segments: list[Segment], output_path: str):
 # 主流程
 # ═══════════════════════════════════════════════════════════════════
 
+def _correct_av_sync(segments: list[Segment], media_info: dict,
+                     processed_audio_dur: float) -> list[Segment]:
+    """校正字幕时间轴 — 补偿音视频不同步
+
+    修正两种问题：
+    1. 音频流起始偏移 (start_time != 0) → 所有时间戳平移
+    2. 处理后音频时长 vs 视频时长不一致 → 按比例缩放时间戳
+
+    常见于：
+    - MOV 文件（相机/录屏软件产出的文件常有此问题）
+    - 音频编码延迟（AAC priming samples 导致起始偏移）
+    - 容器封装错误（音视频轨时长不一致）
+    """
+    if not segments or not media_info:
+        return segments
+
+    video_dur = media_info.get('video_duration', 0)
+    audio_start = media_info.get('audio_start_time', 0)
+    format_dur = media_info.get('format_duration', 0)
+
+    # 如果没有独立的视频流时长，用容器时长作为参考
+    if video_dur <= 0:
+        video_dur = format_dur
+
+    if video_dur <= 0 or processed_audio_dur <= 0:
+        return segments
+
+    need_correction = False
+    scale = 1.0
+    offset = 0.0
+
+    # 1. 音频流起始偏移校正
+    #    如果音频流 start_time = 0.5s，说明音频比视频晚 0.5s 开始
+    #    Whisper 时间戳是基于音频的 → 字幕需要往后移 0.5s
+    if abs(audio_start) > 0.01:
+        offset = audio_start  # start_time > 0 时，字幕要加上这个偏移
+        need_correction = True
+        logger.info(f"   🔧 检测到音频流起始偏移: {audio_start:+.3f}s")
+
+    # 2. 时长比例校正（修复渐进式漂移）
+    #    如果处理后音频时长和视频时长不一致（常见原因：容器封装问题、loudnorm 残留影响）
+    #    → 按 视频时长/音频时长 缩放所有时间戳
+    duration_diff = abs(processed_audio_dur - video_dur)
+    if duration_diff > 0.5:  # 超过 0.5 秒才校正
+        scale = video_dur / processed_audio_dur
+        need_correction = True
+        drift_per_min = (processed_audio_dur - video_dur) / (video_dur / 60)
+        logger.warning(f"   ⚠️  检测到音视频时长不一致！")
+        logger.warning(f"      视频时长: {video_dur:.2f}s, 处理后音频: {processed_audio_dur:.2f}s")
+        logger.warning(f"      差异: {duration_diff:.2f}s (每分钟漂移约 {abs(drift_per_min):.2f}s)")
+        logger.info(f"   🔧 时间轴缩放校正: ×{scale:.6f}")
+
+    if not need_correction:
+        logger.info(f"   ✅ 音视频同步检查通过（差异 < 0.5s）")
+        return segments
+
+    # 应用校正: new_time = old_time * scale + offset
+    for seg in segments:
+        seg.start = round(max(0, seg.start * scale + offset), 3)
+        seg.end = round(max(seg.start + 0.1, seg.end * scale + offset), 3)
+
+    logger.info(f"   ✅ 时间轴校正完成 ({len(segments)} 段)")
+    return segments
+
+
 def process_video(video_path: str, config: Config, output_dir: Optional[str] = None):
     """处理单个视频文件的完整流程
 
@@ -1955,6 +2165,25 @@ def process_video(video_path: str, config: Config, output_dir: Optional[str] = N
                 config.demucs_device = auto_demucs
         if not config.demucs_device:
             config.demucs_device = config.device
+
+        # ═══════════════════════════════════════════════════════════
+        # Step 0: 获取源视频的媒体信息（音视频同步检测用）
+        # ═══════════════════════════════════════════════════════════
+        media_info = get_media_info(video_path)
+        if media_info:
+            v_dur = media_info.get('video_duration', 0)
+            a_dur = media_info.get('audio_duration', 0)
+            a_start = media_info.get('audio_start_time', 0)
+            a_sr = media_info.get('audio_sample_rate', 0)
+            f_dur = media_info.get('format_duration', 0)
+            logger.info(f"📊 源视频信息: 容器 {f_dur:.2f}s, "
+                        f"视频流 {v_dur:.2f}s, 音频流 {a_dur:.2f}s, "
+                        f"音频起始 {a_start:.3f}s, 采样率 {a_sr}Hz")
+            # 预警
+            if v_dur > 0 and a_dur > 0 and abs(v_dur - a_dur) > 0.5:
+                logger.warning(f"   ⚠️  音视频流时长不一致 (差 {abs(v_dur - a_dur):.2f}s)，将在输出前自动校正")
+            if abs(a_start) > 0.01:
+                logger.warning(f"   ⚠️  音频流有起始偏移 ({a_start:+.3f}s)，将在输出前自动校正")
 
         # ═══════════════════════════════════════════════════════════
         # Step 1: 音频提取
@@ -2014,6 +2243,18 @@ def process_video(video_path: str, config: Config, output_dir: Optional[str] = N
                 except Exception:
                     shutil.copy2(vocals_audio, enhanced_audio)
 
+        # ─── 管道时长验证（诊断处理步骤是否改变了音频时长） ───
+        raw_dur = get_audio_duration(raw_audio)
+        vocals_dur = 0.0
+        if not config.skip_demucs and os.path.exists(vocals_audio):
+            vocals_dur = get_audio_duration(vocals_audio)
+            if raw_dur > 0 and vocals_dur > 0 and abs(vocals_dur - raw_dur) > 0.5:
+                logger.warning(f"   ⚠️  Demucs 改变了音频时长！原始: {raw_dur:.2f}s → 分离后: {vocals_dur:.2f}s")
+        enhanced_dur = get_audio_duration(enhanced_audio)
+        ref_dur = vocals_dur if vocals_dur > 0 else raw_dur
+        if ref_dur > 0 and enhanced_dur > 0 and abs(enhanced_dur - ref_dur) > 0.5:
+            logger.warning(f"   ⚠️  语音增强改变了音频时长！处理前: {ref_dur:.2f}s → 增强后: {enhanced_dur:.2f}s")
+
         # ═══════════════════════════════════════════════════════════
         # Step 3.5: VAD 语音区域检测（容错：失败则跳过）
         # ═══════════════════════════════════════════════════════════
@@ -2068,26 +2309,21 @@ def process_video(video_path: str, config: Config, output_dir: Optional[str] = N
         # Step 5.5: VAD 交叉验证 + 二次转录遗漏区域
         # ═══════════════════════════════════════════════════════════
         if config.vad_filter and speech_regions:
-            segments = vad_validate(segments, speech_regions, config)
+            segments, missed = vad_validate(segments, speech_regions, config)
 
             # ★ 二次转录遗漏区域
-            if config.retranscribe_missed:
-                missed = detect_missed_speech(
-                    segments, speech_regions,
-                    min_duration=config.retranscribe_min_duration,
-                )
-                if missed:
-                    try:
-                        new_segs = retranscribe_missed_regions(
-                            enhanced_audio, missed, config, temp_dir
-                        )
-                        if new_segs:
-                            segments.extend(new_segs)
-                            segments.sort(key=lambda s: s.start)
-                            logger.info(f"   合并后总计: {len(segments)} 段")
-                    except Exception as e:
-                        logger.warning(f"⚠️  二次转录失败: {e}")
-                        logger.warning("   🔄 降级方案: 仅使用第一次转录结果")
+            if config.retranscribe_missed and missed:
+                try:
+                    new_segs = retranscribe_missed_regions(
+                        enhanced_audio, missed, config, temp_dir
+                    )
+                    if new_segs:
+                        segments.extend(new_segs)
+                        segments.sort(key=lambda s: s.start)
+                        logger.info(f"   合并后总计: {len(segments)} 段")
+                except Exception as e:
+                    logger.warning(f"⚠️  二次转录失败: {e}")
+                    logger.warning("   🔄 降级方案: 仅使用第一次转录结果")
 
         # ═══════════════════════════════════════════════════════════
         # Step 6: 后处理 + 输出
@@ -2097,6 +2333,12 @@ def process_video(video_path: str, config: Config, output_dir: Optional[str] = N
         if not segments:
             logger.warning("⚠️  未识别到任何有效字幕段！")
             return
+
+        # ═══════════════════════════════════════════════════════════
+        # Step 6.5: 音视频同步校正（修复时间轴漂移）
+        # ═══════════════════════════════════════════════════════════
+        logger.info("🔄 音视频同步检查...")
+        segments = _correct_av_sync(segments, media_info, audio_duration)
 
         # 写入文件
         logger.info("💾 写入字幕文件...")
@@ -2187,6 +2429,12 @@ def parse_args():
   python tiqu.py video.mp4 --config tiqu-config.yaml        # 使用配置文件
   python tiqu.py *.mp4 --output-dir ./subtitles             # 批量处理
         """,
+    )
+
+    parser.add_argument(
+        "--version", "-V",
+        action="version",
+        version=f"tiqu-jp {__version__}",
     )
 
     # --- 位置参数 ---
@@ -2513,15 +2761,37 @@ def main():
         unit="个",
     ) if len(videos) > 1 else videos
 
+    # 批量处理统计
+    succeeded = []
+    failed = []
+
     for video_path in video_iter:
         try:
             process_video(video_path, config, args.output_dir)
+            succeeded.append(video_path)
+        except KeyboardInterrupt:
+            logger.warning("\n⚠️  用户中断 (Ctrl+C)，停止处理")
+            break
         except Exception as e:
             logger.error(f"❌ 处理失败 [{video_path}]: {e}")
+            failed.append((video_path, str(e)))
             if args.verbose:
                 import traceback
                 traceback.print_exc()
             continue
+
+    # 批量处理汇总（多文件时显示）
+    if len(videos) > 1:
+        logger.info("")
+        logger.info("═" * 55)
+        logger.info("📊 批量处理汇总")
+        logger.info(f"   总计: {len(videos)} 个文件")
+        logger.info(f"   成功: {len(succeeded)} ✅")
+        if failed:
+            logger.info(f"   失败: {len(failed)} ❌")
+            for path, err in failed:
+                logger.info(f"      • {Path(path).name}: {err[:60]}")
+        logger.info("═" * 55)
 
 
 if __name__ == "__main__":
